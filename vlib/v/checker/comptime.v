@@ -1018,6 +1018,30 @@ fn (mut c Checker) comptime_if_cond(mut cond ast.Expr, mut sb strings.Builder) (
 				}
 				.eq, .ne, .gt, .lt, .ge, .le {
 					match mut cond.left {
+						ast.AtExpr {
+							// @OS == 'linux'
+							left_type := c.expr(mut cond.left)
+							right_type := c.expr(mut cond.right)
+							if !c.check_types(right_type, left_type) {
+								left_name := c.table.type_to_str(left_type)
+								right_name := c.table.type_to_str(right_type)
+								c.error('mismatched types `${left_name}` and `${right_name}`',
+									cond.pos)
+							}
+							left_str := cond.left.val
+							right_str := (cond.right as ast.StringLiteral).val
+							if cond.op == .eq {
+								is_true = left_str == right_str
+							} else if cond.op == .ne {
+								is_true = left_str != right_str
+							} else {
+								c.error('string type only support `==` and `!=` operator',
+									cond.pos)
+								return false, false
+							}
+							sb.write_string('${is_true}')
+							return is_true, false
+						}
 						ast.Ident {
 							// $if version == 2
 							left_type := c.expr(mut cond.left)
@@ -1374,7 +1398,7 @@ fn (mut c Checker) comptime_if_cond(mut cond ast.Expr, mut sb strings.Builder) (
 		}
 		ast.SelectorExpr {
 			if c.comptime.comptime_for_field_var != '' && cond.expr is ast.Ident {
-				if (cond.expr as ast.Ident).name == c.comptime.comptime_for_field_var && cond.field_name in ['is_mut', 'is_pub', 'is_shared', 'is_atomic', 'is_option', 'is_array', 'is_map', 'is_chan', 'is_struct', 'is_alias', 'is_enum'] {
+				if (cond.expr as ast.Ident).name == c.comptime.comptime_for_field_var && cond.field_name in ['is_mut', 'is_pub', 'is_embed', 'is_shared', 'is_atomic', 'is_option', 'is_array', 'is_map', 'is_chan', 'is_struct', 'is_alias', 'is_enum'] {
 					is_true = c.type_resolver.get_comptime_selector_bool_field(cond.field_name)
 					sb.write_string('${is_true}')
 					return is_true, true
