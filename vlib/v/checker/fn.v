@@ -104,6 +104,7 @@ fn (mut c Checker) fn_decl(mut node ast.FnDecl) {
 		if !node.is_method && node.mod == 'main' && node.short_name in c.table.builtin_pub_fns {
 			c.error('cannot redefine builtin public function `${node.short_name}`', node.pos)
 		}
+		c.check_module_name_conflict(node.short_name, node.pos)
 	}
 	if node.name == 'main.main' {
 		c.main_fn_decl_node = *node
@@ -114,6 +115,22 @@ fn (mut c Checker) fn_decl(mut node ast.FnDecl) {
 			if attr := node.attrs.find_first(attr_name) {
 				if attr.arg == '' {
 					c.error('missing argument for @[${attr_name}] attribute', attr.pos)
+				} else if attr_name == 'export' {
+					// export fn name
+					fn_name := attr.arg
+					if !fn_name.is_identifier() {
+						c.error('export name `${fn_name}` should be a valid identifier',
+							node.pos)
+					}
+					if fn_name in c.table.export_names.values() {
+						c.error('duplicate export name `${fn_name}`', node.pos)
+					} else {
+						mut node_name := node.name
+						if node.is_method {
+							node_name = c.table.type_to_str(node.receiver.typ) + '.' + node_name
+						}
+						c.table.export_names[node_name] = fn_name
+					}
 				}
 			}
 		}
@@ -2906,6 +2923,7 @@ fn (mut c Checker) check_expected_arg_count(mut node ast.CallExpr, f &ast.Fn) ! 
 		min_required_params--
 	}
 	if f.is_variadic {
+		node.is_variadic = f.is_variadic
 		min_required_params--
 		c.markused_array_method(!c.is_builtin_mod, '')
 	} else {
@@ -3425,7 +3443,7 @@ fn (mut c Checker) array_builtin_method_call(mut node ast.CallExpr, left_type as
 					'\ne.g. `users.${method_name}(a.id < b.id)`', node.pos)
 			}
 		} else if !(c.table.sym(elem_typ).has_method('<')
-			|| c.table.unalias_num_type(elem_typ) in [ast.int_type, ast.int_type.ref(), ast.string_type, ast.string_type.ref(), ast.i8_type, ast.i16_type, ast.i64_type, ast.u8_type, ast.rune_type, ast.u16_type, ast.u32_type, ast.u64_type, ast.f32_type, ast.f64_type, ast.char_type, ast.bool_type, ast.float_literal_type, ast.int_literal_type]) {
+			|| c.table.unalias_num_type(elem_typ) in [ast.int_type, ast.int_type.ref(), ast.string_type, ast.string_type.ref(), ast.i8_type, ast.i16_type, ast.i32_type, ast.i64_type, ast.u8_type, ast.rune_type, ast.u16_type, ast.u32_type, ast.u64_type, ast.f32_type, ast.f64_type, ast.char_type, ast.bool_type, ast.float_literal_type, ast.int_literal_type]) {
 			c.error('custom sorting condition must be supplied for type `${c.table.type_to_str(elem_typ)}`',
 				node.pos)
 		}
@@ -3776,7 +3794,7 @@ fn (mut c Checker) fixed_array_builtin_method_call(mut node ast.CallExpr, left_t
 					'\ne.g. `users.${method_name}(a.id < b.id)`', node.pos)
 			}
 		} else if !(c.table.sym(elem_typ).has_method('<')
-			|| c.table.unalias_num_type(elem_typ) in [ast.int_type, ast.int_type.ref(), ast.string_type, ast.string_type.ref(), ast.i8_type, ast.i16_type, ast.i64_type, ast.u8_type, ast.rune_type, ast.u16_type, ast.u32_type, ast.u64_type, ast.f32_type, ast.f64_type, ast.char_type, ast.bool_type, ast.float_literal_type, ast.int_literal_type]) {
+			|| c.table.unalias_num_type(elem_typ) in [ast.int_type, ast.int_type.ref(), ast.string_type, ast.string_type.ref(), ast.i8_type, ast.i16_type, ast.i32_type, ast.i64_type, ast.u8_type, ast.rune_type, ast.u16_type, ast.u32_type, ast.u64_type, ast.f32_type, ast.f64_type, ast.char_type, ast.bool_type, ast.float_literal_type, ast.int_literal_type]) {
 			c.error('custom sorting condition must be supplied for type `${c.table.type_to_str(elem_typ)}`',
 				node.pos)
 		}

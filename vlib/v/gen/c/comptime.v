@@ -5,7 +5,6 @@ module c
 
 import os
 import v.ast
-import v.token
 import v.util
 import v.pref
 import v.type_resolver
@@ -418,13 +417,9 @@ fn (mut g Gen) comptime_if(node ast.IfExpr) {
 		start_pos := g.out.len
 		// `idx_str` is composed of two parts:
 		// The first part represents the current context of the branch statement, `comptime_branch_context_str`, formatted like `T=int,X=string,method.name=json`
-		// The second part indicates the branch's location in the source file.
+		// The second part is the branch's id.
 		// This format must match what is in `checker`.
-		idx_str := if branch.cond.pos() == token.Pos{} {
-			comptime_branch_context_str + '|${g.file.path}|${branch.pos}|'
-		} else {
-			comptime_branch_context_str + '|${g.file.path}|${branch.cond.pos()}|'
-		}
+		idx_str := comptime_branch_context_str + '|id=${branch.id}|'
 		if comptime_is_true := g.table.comptime_is_true[idx_str] {
 			// `g.table.comptime_is_true` are the branch condition results set by `checker`
 			is_true = comptime_is_true
@@ -654,10 +649,10 @@ fn (mut g Gen) comptime_for(node ast.ComptimeFor) {
 			}
 			if method.params.len < 2 {
 				// 0 or 1 (the receiver) args
-				g.writeln('\t${node.val_var}.args = builtin____new_array_with_default(0, 0, sizeof(MethodParam), 0);')
+				g.writeln('\t${node.val_var}.args = builtin____new_array_with_default(0, 0, sizeof(FunctionParam), 0);')
 			} else {
 				len := method.params.len - 1
-				g.write('\t${node.val_var}.args = builtin__new_array_from_c_array(${len}, ${len}, sizeof(MethodParam), _MOV((MethodParam[${len}]){')
+				g.write('\t${node.val_var}.args = builtin__new_array_from_c_array(${len}, ${len}, sizeof(FunctionParam), _MOV((FunctionParam[${len}]){')
 				// Skip receiver arg
 				for j, arg in method.params[1..] {
 					typ := arg.typ.idx()
@@ -846,12 +841,12 @@ fn (mut g Gen) comptime_for(node ast.ComptimeFor) {
 			}
 		}
 	} else if node.kind == .params {
-		method := g.comptime.comptime_for_method
-
-		if method.params.len > 0 {
-			g.writeln('\tMethodParam ${node.val_var} = {0};')
+		func := if sym.info is ast.FnType { &sym.info.func } else { g.comptime.comptime_for_method }
+		if func.params.len > 0 {
+			g.writeln('\tFunctionParam ${node.val_var} = {0};')
 		}
-		for param in method.params[1..] {
+		params := if func.is_method { func.params[1..] } else { func.params }
+		for param in params {
 			g.push_new_comptime_info()
 			g.comptime.inside_comptime_for = true
 			g.comptime.comptime_for_method_param_var = node.val_var
@@ -984,9 +979,9 @@ fn (mut g Gen) comptime_match(node ast.MatchExpr) {
 	for i, branch in node.branches {
 		// `idx_str` is composed of two parts:
 		// The first part represents the current context of the branch statement, `comptime_branch_context_str`, formatted like `T=int,X=string,method.name=json`
-		// The second part indicates the branch's location in the source file.
+		// The second part is the branch's id.
 		// This format must match what is in `checker`.
-		idx_str := comptime_branch_context_str + '|${g.file.path}|${branch.pos}|'
+		idx_str := comptime_branch_context_str + '|id=${branch.id}|'
 		if comptime_is_true := g.table.comptime_is_true[idx_str] {
 			// `g.table.comptime_is_true` are the branch condition results set by `checker`
 			is_true = comptime_is_true

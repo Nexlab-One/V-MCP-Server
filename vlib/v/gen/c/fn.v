@@ -782,6 +782,9 @@ fn (mut g Gen) fn_decl_params(params []ast.Param, scope &ast.Scope, is_variadic 
 			typ = g.table.sym(typ).array_info().elem_type.set_flag(.variadic)
 		}
 		param_type_sym := g.table.sym(typ)
+		if param.is_mut && param.typ.has_flag(.generic) && typ.has_flag(.option) {
+			typ = typ.set_flag(.option_mut_param_t).set_nr_muls(param.typ.nr_muls() - 1)
+		}
 		mut param_type_name := g.styp(typ)
 		if param.typ.has_flag(.generic) {
 			param_type_name = param_type_name.replace_each(c_fn_name_escape_seq)
@@ -1686,7 +1689,7 @@ fn (mut g Gen) method_call(node ast.CallExpr) {
 		if resolved_sym.is_builtin() && !receiver_type_name.starts_with('_') {
 			name = 'builtin__${name}'
 		}
-	} else if receiver_type_name in ['int_literal', 'float_literal'] {
+	} else if receiver_type_name in ['int_literal', 'float_literal', 'vint_t'] {
 		name = 'builtin__${name}'
 	}
 	if left_sym.kind == .chan && node.name in ['close', 'try_pop', 'try_push'] {
@@ -2056,7 +2059,7 @@ fn (mut g Gen) fn_call(node ast.CallExpr) {
 		}
 	}
 	if node.is_fn_a_const {
-		name = g.c_const_name(node.const_name.replace('.', '__'))
+		name = g.c_const_name(node.const_name)
 	}
 	// TODO2
 	// cgen shouldn't modify ast nodes, this should be moved
@@ -2345,7 +2348,20 @@ fn (mut g Gen) autofree_call_pregen(node ast.CallExpr) {
 			})
 			s = 'string ${t} = '
 		}
-		s += g.expr_string(arg.expr)
+		g.is_autofree_tmp = true
+		pos_before := g.out.len
+
+		old_is_autofree := g.is_autofree
+		if arg.expr is ast.CallExpr && arg.expr.is_method && arg.expr.left is ast.CallExpr {
+			g.is_autofree = false
+		}
+
+		g.expr(arg.expr)
+		expr_code := g.out.cut_to(pos_before).trim_space()
+
+		g.is_autofree = old_is_autofree
+		g.is_autofree_tmp = false
+		s += expr_code
 		s += ';// new af2 pre'
 		g.strs_to_free0 << s
 		// This tmp arg var will be freed with the rest of the vars at the end of the scope.
@@ -2398,8 +2414,8 @@ fn (mut g Gen) call_args(node ast.CallExpr) {
 		}
 	}
 	// only v variadic, C variadic args will be appended like normal args
-	is_variadic := expected_types.len > 0 && expected_types.last().has_flag(.variadic)
-		&& node.language == .v
+	is_variadic := node.language == .v && node.is_variadic && expected_types.len > 0
+		&& expected_types.last().has_flag(.variadic)
 	mut already_decomposed := false
 	for i, arg in args {
 		if is_variadic && i == expected_types.len - 1 {
@@ -2410,11 +2426,7 @@ fn (mut g Gen) call_args(node ast.CallExpr) {
 			if arg.expr.obj is ast.Var {
 				if i < node.expected_arg_types.len && node.expected_arg_types[i].has_flag(.generic)
 					&& arg.expr.obj.ct_type_var !in [.generic_param, .no_comptime] {
-					exp_option := node.expected_arg_types[i].has_flag(.option)
 					expected_types[i] = g.unwrap_generic(g.type_resolver.get_type(arg.expr))
-					if !exp_option {
-						expected_types[i] = expected_types[i].clear_flag(.option)
-					}
 				} else if arg.expr.obj.smartcasts.len > 0 {
 					exp_sym := g.table.sym(expected_types[i])
 					orig_sym := g.table.sym(arg.expr.obj.orig_type)
@@ -2568,6 +2580,14 @@ fn (mut g Gen) call_args(node ast.CallExpr) {
 							false)
 					} else {
 						noscan := g.check_noscan(arr_info.elem_type)
+						is_option := arr_info.elem_type.has_flag(.option)
+						tmp_var := if is_option { g.new_tmp_var() } else { '' }
+						base_type := g.base_type(varg_type)
+						tmp := if is_option { g.go_before_last_stmt() } else { '' }
+						if is_option {
+							g.writeln('${g.styp(varg_type)} ${tmp_var};')
+							g.write('builtin___option_ok((${base_type}[]) {')
+						}
 						g.write('builtin__new_array_from_c_array${noscan}(${variadic_count}, ${variadic_count}, sizeof(${elem_type}), _MOV((${elem_type}[${variadic_count}]){')
 						for j in arg_nr .. args.len {
 							g.ref_or_deref_arg(args[j], arr_info.elem_type, node.language,
@@ -2577,6 +2597,11 @@ fn (mut g Gen) call_args(node ast.CallExpr) {
 							}
 						}
 						g.write('}))')
+						if is_option {
+							g.writeln(' }, (${option_name}*)&${tmp_var}, sizeof(${base_type}));')
+							g.write(tmp)
+							g.write(tmp_var)
+						}
 					}
 				}
 			} else {
@@ -2705,7 +2730,7 @@ fn (mut g Gen) ref_or_deref_arg(arg ast.CallArg, expected_type ast.Type, lang as
 				if arg.expr.is_lvalue() {
 					if expected_type.has_flag(.option) {
 						if expected_type.has_flag(.option_mut_param_t) {
-							g.write('(${g.styp(expected_type)})&')
+							g.write('&')
 						}
 						g.expr_with_opt(arg.expr, arg_typ, expected_type)
 						return
@@ -2808,7 +2833,11 @@ fn (mut g Gen) ref_or_deref_arg(arg ast.CallArg, expected_type ast.Type, lang as
 	}
 	// check if the argument must be dereferenced or not
 	g.arg_no_auto_deref = is_smartcast && !arg_is_ptr && !exp_is_ptr && arg.should_be_ptr
-	g.expr_with_cast(arg.expr, arg_typ, expected_type)
+	if arg_typ.has_flag(.option) {
+		g.expr_with_opt(arg.expr, arg_typ, expected_type.set_flag(.option))
+	} else {
+		g.expr_with_cast(arg.expr, arg_typ, expected_type)
+	}
 	g.arg_no_auto_deref = false
 	g.inside_smartcast = old_inside_smartcast
 	if needs_closing {

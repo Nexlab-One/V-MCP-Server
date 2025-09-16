@@ -130,9 +130,14 @@ fn (mut c Checker) match_expr(mut node ast.MatchExpr) ast.Type {
 		if node.is_comptime {
 			// `idx_str` is composed of two parts:
 			// The first part represents the current context of the branch statement, `comptime_branch_context_str`, formatted like `T=int,X=string,method.name=json`
-			// The second part indicates the branch's location in the source file.
+			// The second part is the branch's id.
 			// This format must match what is in `cgen`.
-			idx_str := comptime_branch_context_str + '|${c.file.path}|${branch.pos}|'
+			if branch.id == 0 {
+				// this is a new branch, alloc a new id for it
+				c.cur_ct_id++
+				branch.id = c.cur_ct_id
+			}
+			idx_str := comptime_branch_context_str + '|id=${branch.id}|'
 			mut c_str := ''
 			if !branch.is_else {
 				if c.inside_x_matches_type {
@@ -390,9 +395,21 @@ fn (mut c Checker) match_expr(mut node ast.MatchExpr) ast.Type {
 											needs_explicit_cast = true
 										}
 									}
-									.i32, .int {
+									.i32 {
 										if !(num >= min_i32 && num <= max_i32) {
 											needs_explicit_cast = true
+										}
+									}
+									.int {
+										$if new_int ? && (arm64 || amd64 || rv64
+											|| s390x || ppc64le || loongarch64) {
+											if !(num >= min_i64 && num <= max_i64) {
+												needs_explicit_cast = true
+											}
+										} $else {
+											if !(num >= min_i32 && num <= max_i32) {
+												needs_explicit_cast = true
+											}
 										}
 									}
 									.i64 {
