@@ -334,6 +334,9 @@ pub fn (mut p Parser) parse() &ast.File {
 		notices << p.scanner.notices
 	}
 
+	if p.pref.is_check_overflow {
+		p.register_auto_import('builtin.overflow')
+	}
 	p.handle_codegen_for_file()
 
 	ast_file := &ast.File{
@@ -1165,7 +1168,7 @@ fn (mut p Parser) semicolon_stmt() ast.SemicolonStmt {
 }
 
 fn (mut p Parser) expr_list(expect_value bool) []ast.Expr {
-	mut exprs := []ast.Expr{}
+	mut exprs := []ast.Expr{cap: 1}
 	for {
 		expr := if expect_value { p.expr(0) } else { p.expr_no_value(0) }
 		if expr !is ast.Comment {
@@ -2608,12 +2611,14 @@ fn (mut p Parser) global_decl() ast.GlobalDecl {
 	mut is_exported := false
 	mut is_weak := false
 	mut is_hidden := false
+	mut is_extern := false
 	for ga in attrs {
 		match ga.name {
 			'export' { is_exported = true }
 			'markused' { is_markused = true }
 			'weak' { is_weak = true }
 			'hidden' { is_hidden = true }
+			'c_extern' { is_extern = true }
 			else {}
 		}
 	}
@@ -2648,8 +2653,10 @@ fn (mut p Parser) global_decl() ast.GlobalDecl {
 		if p.tok.kind == .rpar {
 			break
 		}
+		language := p.parse_language()
+
 		pos := p.tok.pos()
-		name := p.check_name()
+		mut name := p.check_name()
 		has_expr := p.tok.kind == .assign
 		mut expr := ast.empty_expr
 		mut typ := ast.void_type
@@ -2687,6 +2694,9 @@ fn (mut p Parser) global_decl() ast.GlobalDecl {
 			typ_pos = p.tok.pos()
 			typ = p.parse_type()
 		}
+		if language == .c {
+			name = 'C.' + name
+		}
 		field := ast.GlobalField{
 			name:        name
 			has_expr:    has_expr
@@ -2700,6 +2710,8 @@ fn (mut p Parser) global_decl() ast.GlobalDecl {
 			is_exported: is_exported
 			is_weak:     is_weak
 			is_hidden:   is_hidden
+			is_extern:   is_extern
+			language:    language
 		}
 		fields << field
 		if name !in ast.global_reserved_type_names {

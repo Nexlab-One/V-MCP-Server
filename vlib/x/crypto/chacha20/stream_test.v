@@ -1,6 +1,37 @@
 module chacha20
 
+import rand
 import encoding.hex
+
+// Test for Stream counter handling.
+// See the discussion at [here](https://discord.com/channels/592103645835821068/592114487759470596/1417900997090607215)
+fn test_stream_counter_handling() ! {
+	// creates a original mode of the cipher with 64-bit counter
+	mut ctx := new_cipher(rand.bytes(32)!, rand.bytes(8)!)!
+	// set the cipher's counter near the maximum of 64-bit counter
+	ctr := max_u64 - 2
+	ctx.set_counter(ctr)
+
+	// by setting internal counter into near of max 64-bit counter,
+	// it need a message with minimum length of  2*block_size bytes to reach the limit.
+	// let's build this message with 2 * block_size bytes in size
+	msg0 := []u8{len: 2 * block_size}
+	mut dst := []u8{len: msg0.len}
+	ctx.xor_key_stream(mut dst, msg0)
+	// at this step, the counter has reached the maximum_64bit_counter, but still not overflow
+	assert ctx.Stream.overflow == false
+	assert ctx.Stream.ctr() == max_64bit_counter
+
+	// after above process, the counter should reach the maximum limit
+	// we use keystream_full to test this counter handling, because
+	// xor_key_stream would panic on counter reset
+	msg1 := []u8{len: block_size}
+	ctx.Stream.keystream_full(mut dst[..block_size], msg1) or {
+		assert ctx.Stream.overflow == true
+		assert err == error('chacha20: internal counter overflow')
+		return
+	}
+}
 
 fn test_qround_on_state() {
 	mut s := State{}
@@ -23,11 +54,11 @@ fn test_state_of_chacha20_block_simple() ! {
 	nonce := '000000090000004a00000000'
 	nonce_bytes := hex.decode(nonce)!
 
-	mut stream := new_stream(key_bytes, nonce_bytes)!
+	mut stream := new_stream_with_options(key_bytes, nonce_bytes)!
 
 	mut block := []u8{len: block_size}
 	stream.set_ctr(1)
-	stream.keystream_with_blocksize(mut block, block)
+	stream.keystream_full(mut block, block)!
 
 	expected_raw_bytes := '10f1e7e4d13b5915500fdd1fa32071c4c7d1f4c733c068030422aa9ac3d46c4ed2826446079faa0914c2d705d98b02a2b5129cd1de164eb9cbd083e8a2503c4e'
 	exp_bytes := hex.decode(expected_raw_bytes)!
@@ -35,16 +66,16 @@ fn test_state_of_chacha20_block_simple() ! {
 	assert block == exp_bytes
 }
 
-fn test_keystream_with_blocksize() ! {
+fn test_keystream_encryption() ! {
 	for val in blocks_testcases {
 		key := hex.decode(val.key)!
 		nonce := hex.decode(val.nonce)!
 
-		mut stream := new_stream(key, nonce)!
+		mut stream := new_stream_with_options(key, nonce)!
 		stream.set_ctr(val.counter)
 
 		mut block := []u8{len: block_size}
-		stream.keystream_with_blocksize(mut block, block)
+		stream.keystream_full(mut block, block)!
 		exp_bytes := hex.decode(val.output)!
 
 		assert block == exp_bytes

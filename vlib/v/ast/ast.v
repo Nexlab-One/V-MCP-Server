@@ -24,12 +24,7 @@ pub const builtins = ['string', 'array', 'DenseArray', 'map', 'Error', 'IError',
 
 pub type TypeDecl = AliasTypeDecl | FnTypeDecl | SumTypeDecl
 
-pub const int_type_name = $if new_int ?
-	&& (arm64 || amd64 || rv64 || s390x || ppc64le || loongarch64) {
-	'vint_t'
-} $else {
-	'int'
-}
+pub const int_type_name = $if new_int ? && x64 { 'vint_t' } $else { 'int' }
 
 pub type Expr = NodeError
 	| AnonFn
@@ -605,6 +600,7 @@ pub:
 	is_unsafe             bool        // true, when @[unsafe] is used on a fn
 	is_must_use           bool        // true, when @[must_use] is used on a fn. Calls to such functions, that ignore the return value, will cause warnings.
 	is_markused           bool        // true, when an explicit `@[markused]` tag was put on a fn; `-skip-unused` will not remove that fn
+	is_ignore_overflow    bool        // true, when an explicit `@[ignore_overflow]` tag was put on a fn. `-check-overflow` will not generate checks for arithmetic done in that fn.
 	is_file_translated    bool        // true, when the file it resides in is `@[translated]`
 	is_closure            bool        // true, for actual closures like `fn [inherited] () {}` . It is false for normal anonymous functions, and for named functions/methods too.
 	receiver              StructField // TODO: this is not a struct field
@@ -626,7 +622,7 @@ pub:
 	body_pos              token.Pos // function bodys position
 	file                  string
 	generic_names         []string
-	is_direct_arr         bool // direct array access
+	is_direct_arr         bool // @[direct_array_access] was used; a[i] inside such a fn, will *not* do array index bounds checks.
 	attrs                 []Attr
 	ctdefine_idx          int = -1 // the index in fn.attrs of `[if xyz]`, when such attribute exists
 pub mut:
@@ -972,6 +968,12 @@ pub:
 	is_exported bool // an explicit `@[export]` tag; the global will NOT be removed by `-skip-unused`
 	is_weak     bool
 	is_hidden   bool
+	// The following fields, are relevant for non V globals, for example `__global C.stdout &C.FILE`:
+	language  Language // for C.stdout, it will be .c .
+	is_extern bool     // true, if an explicit `@[c_extern]` tag was used. It is suitable for globals, that are not initialised by V,
+	// but come from the external linked objects/libs, like C.stdout etc, and that *are not* declared in included .h files .
+	// Without an explicit `@[c_extern]` tag, V will avoid emiting `extern CType CName;` lines.
+	// V will still know, that the type of C.stdout, is not the default `int`, but &C.FILE, and thus will do more checks on it.
 pub mut:
 	expr     Expr
 	typ      Type
@@ -1296,10 +1298,11 @@ pub:
 	post_comments []Comment // comments below ´... }´
 	branch_pos    token.Pos // for checker errors about invalid branches
 pub mut:
-	stmts []Stmt // right side
-	exprs []Expr // left side
-	scope &Scope = unsafe { nil }
-	id    int
+	stmts           []Stmt // right side
+	exprs           []Expr // left side
+	scope           &Scope = unsafe { nil }
+	id              int
+	is_comptime_err bool // $compile_warn(), $compile_error()
 }
 
 pub struct SelectExpr {

@@ -1179,6 +1179,10 @@ fn (mut c Checker) type_implements(typ ast.Type, interface_type ast.Type, pos to
 	if typ_sym.name == 'JS.Any' {
 		return true
 	}
+	if typ_sym.kind == .function && inter_sym.name != 'JS.Any' {
+		c.error('cannot implement interface `${inter_sym.name}` using function', pos)
+		return false
+	}
 	if mut inter_sym.info is ast.Interface {
 		mut generic_type := interface_type
 		mut generic_info := inter_sym.info
@@ -2075,7 +2079,7 @@ fn (mut c Checker) enum_decl(mut node ast.EnumDecl) {
 			signed, enum_imin, enum_imax = true, min_i32, max_i32
 		}
 		ast.int_type {
-			$if new_int ? && (arm64 || amd64 || rv64 || s390x || ppc64le || loongarch64) {
+			$if new_int ? && x64 {
 				signed, enum_imin, enum_imax = true, min_i32, max_i32
 			} $else {
 				signed, enum_imin, enum_imax = true, min_i64, max_i64
@@ -2529,7 +2533,9 @@ fn (mut c Checker) global_decl(mut node ast.GlobalDecl) {
 		}
 	}
 	for mut field in node.fields {
-		c.check_valid_snake_case(field.name, 'global name', field.pos)
+		if field.language != .c {
+			c.check_valid_snake_case(field.name, 'global name', field.pos)
+		}
 
 		if field.name in ast.global_reserved_type_names {
 			c.error('invalid use of reserved type `${field.name}` as a global name', field.pos)
@@ -3835,7 +3841,7 @@ fn (mut c Checker) cast_expr(mut node ast.CastExpr) ast.Type {
 					u64(0xffffffff)
 				}
 				ast.int_type_idx {
-					$if new_int ? && (arm64 || amd64 || rv64 || s390x || ppc64le || loongarch64) {
+					$if new_int ? && x64 {
 						u64(0xffffffffffffffff)
 					} $else {
 						u64(0xffffffff)
@@ -4210,7 +4216,9 @@ fn (mut c Checker) ident(mut node ast.Ident) ast.Type {
 			c.error('`mut` is not allowed with `=` (use `:=` to declare a variable)',
 				node.pos)
 		}
-		if mut obj := node.scope.find(node.name) {
+		mut pobj := node.scope.find_ptr(node.name)
+		if pobj != unsafe { nil } {
+			mut obj := *pobj
 			match mut obj {
 				ast.GlobalField {
 					if node.mod == '' {
@@ -4320,7 +4328,9 @@ fn (mut c Checker) ident(mut node ast.Ident) ast.Type {
 		else if !name.contains('.') && node.mod != 'builtin' {
 			name = '${node.mod}.${node.name}'
 		}
-		if mut obj := c.file.global_scope.find(name) {
+		pobj = c.file.global_scope.find_ptr(name)
+		if pobj != unsafe { nil } {
+			mut obj := *pobj
 			match mut obj {
 				ast.GlobalField {
 					node.kind = .global

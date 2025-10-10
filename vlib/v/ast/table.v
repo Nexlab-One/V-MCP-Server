@@ -24,8 +24,8 @@ pub mut:
 	arr_delete     bool            // arr.delete()
 	arr_reverse    bool            // arr.reverse()
 	arr_map        bool            // []map[key]value
-	type_name      bool            // var.type_name()
 	print_options  bool            // print option type
+	safe_int       bool            // needs safe int comparison
 	print_types    map[int]bool    // print() idx types
 	used_fns       map[string]bool // filled in by markused
 	used_consts    map[string]bool // filled in by markused
@@ -833,6 +833,24 @@ pub fn (t &Table) unaliased_type(typ Type) Type {
 		return sym.info.parent_type
 	}
 	return typ
+}
+
+// update_sym_by_idx replaces the symbol on the `existing_idx`, with the new `sym`
+pub fn (mut t Table) update_sym_by_idx(existing_idx int, sym &TypeSymbol) {
+	t.delete_cached_type_to_str(idx_to_type(existing_idx), 0)
+	t.type_symbols[existing_idx] = &TypeSymbol{
+		...sym
+		idx:   existing_idx
+		size:  -1 // enforce recalculation of the size, for future t.type_size(idx) calls
+		align: -1
+	}
+	for mut esym in t.type_symbols {
+		if esym.size != -1 && esym.info is Alias && esym.info.parent_type == existing_idx {
+			// make sure to force recalculation, if t.type_size(idx) on an already existing alias is called again:
+			esym.size = -1
+			esym.align = -1
+		}
+	}
 }
 
 fn (mut t Table) rewrite_already_registered_symbol(typ TypeSymbol, existing_idx int) int {

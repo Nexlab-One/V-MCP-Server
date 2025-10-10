@@ -168,6 +168,7 @@ mut:
 	last_tmp_call_var         []string
 	last_if_option_type       ast.Type // stores the expected if type on nested if expr
 	loop_depth                int
+	unsafe_level              int
 	ternary_names             map[string]string
 	ternary_level_names       map[string][]string
 	arraymap_set_pos          int      // map or array set value position
@@ -280,6 +281,8 @@ mut:
 	definition_nodes        []&ast.HashStmtNode // allows hash stmts to go `definitions`
 	postinclude_nodes       []&ast.HashStmtNode // allows hash stmts to go after all the rest of the code generation
 	curr_comptime_node      &ast.Expr = unsafe { nil } // current `$if` expr
+	is_builtin_overflow_mod bool
+	do_int_overflow_checks  bool // outside a `@[ignore_overflow] fn abc() {}` or a function in `builtin.overflow`
 }
 
 @[heap]
@@ -1002,6 +1005,9 @@ pub fn (mut g Gen) init() {
 		} else {
 			g.cheaders.writeln(c_headers)
 		}
+		if !g.pref.skip_unused || g.table.used_features.safe_int {
+			g.cheaders.writeln(c_unsigned_comparison_functions)
+		}
 		if !g.pref.skip_unused || g.table.used_features.used_attr_weak {
 			g.cheaders.writeln(c_common_weak_attr)
 		}
@@ -1084,9 +1090,9 @@ pub fn (mut g Gen) init() {
 	if g.use_segfault_handler {
 		muttable.used_features.used_fns['v_segmentation_fault_handler'] = true
 	}
-	muttable.used_features.used_fns['eprintln'] = true
-	muttable.used_features.used_fns['print_backtrace'] = true
-	muttable.used_features.used_fns['exit'] = true
+	// muttable.used_features.used_fns['eprintln'] = true
+	// muttable.used_features.used_fns['print_backtrace'] = true
+	// muttable.used_features.used_fns['exit'] = true
 }
 
 pub fn (mut g Gen) finish() {
@@ -1220,23 +1226,26 @@ pub fn (mut g Gen) write_typeof_functions() {
 				g.writeln('\tif (sidx == _${sym.cname}_${sub_sym.cname}_index) return "${util.strip_main_name(sub_sym.name)}";')
 			}
 			g.writeln2('\treturn "unknown ${util.strip_main_name(sym.name)}";', '}')
-			g.definitions.writeln('u32 v_typeof_interface_idx_${sym.cname}(u32 sidx);')
-			g.writeln2('', 'u32 v_typeof_interface_idx_${sym.cname}(u32 sidx) {')
-			if g.pref.parallel_cc {
-				g.extern_out.writeln('extern u32 v_typeof_interface_idx_${sym.cname}(u32 sidx);')
-			}
-			for t in inter_info.types {
-				sub_sym := g.table.sym(ast.mktyp(t))
-				if sub_sym.info is ast.Struct && sub_sym.info.is_unresolved_generic() {
-					continue
+			// Avoid duplicate symbol '_v_typeof_interface_idx_IError' when using -usecache
+			if g.pref.build_mode != .build_module {
+				g.definitions.writeln('u32 v_typeof_interface_idx_${sym.cname}(u32 sidx);')
+				g.writeln2('', 'u32 v_typeof_interface_idx_${sym.cname}(u32 sidx) {')
+				if g.pref.parallel_cc {
+					g.extern_out.writeln('extern u32 v_typeof_interface_idx_${sym.cname}(u32 sidx);')
 				}
-				if g.pref.skip_unused && sub_sym.kind == .struct
-					&& sub_sym.idx !in g.table.used_features.used_syms {
-					continue
+				for t in inter_info.types {
+					sub_sym := g.table.sym(ast.mktyp(t))
+					if sub_sym.info is ast.Struct && sub_sym.info.is_unresolved_generic() {
+						continue
+					}
+					if g.pref.skip_unused && sub_sym.kind == .struct
+						&& sub_sym.idx !in g.table.used_features.used_syms {
+						continue
+					}
+					g.writeln('\tif (sidx == _${sym.cname}_${sub_sym.cname}_index) return ${u32(t.set_nr_muls(0))};')
 				}
-				g.writeln('\tif (sidx == _${sym.cname}_${sub_sym.cname}_index) return ${u32(t.set_nr_muls(0))};')
+				g.writeln2('\treturn ${u32(ityp)};', '}')
 			}
-			g.writeln2('\treturn ${u32(ityp)};', '}')
 		}
 	}
 	g.writeln2('// << typeof() support for sum types', '')
@@ -2523,6 +2532,10 @@ fn (mut g Gen) stmt(node ast.Stmt) {
 		}
 		ast.Block {
 			g.write_v_source_line_info_stmt(node)
+			if node.is_unsafe {
+				g.unsafe_level++
+			}
+
 			if !node.is_unsafe {
 				g.writeln('{')
 			} else {
@@ -2534,6 +2547,9 @@ fn (mut g Gen) stmt(node ast.Stmt) {
 			}
 			g.stmts(node.stmts)
 			g.writeln('}')
+			if node.is_unsafe {
+				g.unsafe_level--
+			}
 		}
 		ast.AssignStmt {
 			g.write_v_source_line_info_stmt(node)
@@ -2727,6 +2743,7 @@ fn (mut g Gen) stmt(node ast.Stmt) {
 		}
 		ast.Module {
 			g.is_builtin_mod = util.module_is_builtin(node.name)
+			g.is_builtin_overflow_mod = node.name == 'builtin.overflow'
 			g.cur_mod = node
 		}
 		ast.EmptyStmt {}
@@ -2914,9 +2931,13 @@ fn (mut g Gen) call_cfn_for_casting_expr(fname string, expr ast.Expr, exp ast.Ty
 		is_cast_fixed_array_init := expr is ast.CastExpr
 			&& (expr.expr is ast.ArrayInit && expr.expr.is_fixed)
 
+		is_primitive_to_interface := fname.contains('_to_Interface_') && expr is ast.Ident
+			&& g.table.sym(got).kind in [.i8, .i16, .i32, .int, .i64, .isize, .u8, .u16, .u32, .u64, .usize, .f32, .f64, .bool, .rune]
+
 		if !is_cast_fixed_array_init && (is_comptime_variant || !expr.is_lvalue()
 			|| (expr is ast.Ident && (expr.obj.is_simple_define_const()
-			|| (expr.obj is ast.Var && expr.obj.is_index_var)))) {
+			|| (expr.obj is ast.Var && expr.obj.is_index_var)))
+			|| is_primitive_to_interface) {
 			// Note: the `_to_sumtype_` family of functions do call memdup internally, making
 			// another duplicate with the HEAP macro is redundant, so use ADDR instead:
 			if expr.is_as_cast() {
@@ -3579,7 +3600,7 @@ fn (mut g Gen) map_fn_ptrs(key_sym ast.TypeSymbol) (string, string, string, stri
 			clone_fn = 'builtin__map_enum_fn(3,sizeof(${key_sym.cname}))'
 		}
 		.int {
-			$if new_int ? && (arm64 || amd64 || rv64 || s390x || ppc64le || loongarch64) {
+			$if new_int ? && x64 {
 				hash_fn = '&builtin__map_hash_int_8'
 				key_eq_fn = '&builtin__map_eq_int_8'
 				clone_fn = '&builtin__map_clone_int_8'
@@ -3896,6 +3917,8 @@ fn (mut g Gen) expr(node_ ast.Expr) {
 			if node.auto_locked != '' {
 				g.writeln('sync__RwMutex_lock(&${node.auto_locked}->mtx);')
 			}
+			is_safe_inc := g.do_int_overflow_checks && node.op == .inc
+			is_safe_dec := g.do_int_overflow_checks && node.op == .dec
 			g.inside_map_postfix = true
 			if node.is_c2v_prefix {
 				g.write(node.op.str())
@@ -3937,8 +3960,18 @@ fn (mut g Gen) expr(node_ ast.Expr) {
 				g.expr(node.expr)
 			}
 			g.inside_map_postfix = false
-			if !node.is_c2v_prefix && node.op != .question {
+			if !node.is_c2v_prefix && node.op != .question && !is_safe_inc && !is_safe_dec {
 				g.write(node.op.str())
+			} else if is_safe_inc || is_safe_dec {
+				overflow_styp := g.styp(get_overflow_fn_type(node.typ))
+				vsafe_fn_name := if is_safe_inc {
+					'builtin__overflow__add_${overflow_styp}'
+				} else {
+					'builtin__overflow__sub_${overflow_styp}'
+				}
+				g.write('=${vsafe_fn_name}(')
+				g.expr(node.expr)
+				g.write(',1)')
 			}
 			if node.auto_locked != '' {
 				g.writeln(';')
@@ -4080,7 +4113,9 @@ fn (mut g Gen) expr(node_ ast.Expr) {
 			g.typeof_expr(node)
 		}
 		ast.UnsafeExpr {
+			g.unsafe_level++
 			g.expr(node.expr)
+			g.unsafe_level--
 		}
 	}
 	g.discard_or_result = old_discard_or_result
@@ -5575,6 +5610,10 @@ fn (mut g Gen) cast_expr(node ast.CastExpr) {
 	}
 	node_typ_is_option := node.typ.has_flag(.option)
 	if sym.kind in [.sum_type, .interface] {
+		if g.table.unaliased_type(expr_type) == node_typ {
+			g.expr(node.expr)
+			return
+		}
 		if node_typ_is_option && node.expr is ast.None {
 			g.gen_option_error(node.typ, node.expr)
 		} else if node.expr is ast.Ident && g.comptime.is_comptime_variant_var(node.expr) {
@@ -6778,9 +6817,6 @@ fn (mut g Gen) write_init_function() {
 		g.export_funcs << '_vinit_caller'
 		g.writeln('void _vinit_caller() {')
 		g.writeln('\tstatic bool once = false; if (once) {return;} once = true;')
-		if g.nr_closures > 0 {
-			g.writeln('\tbuiltin__closure__closure_init(); // vinit_caller()')
-		}
 		g.writeln('\t_vinit(0,0);')
 		g.writeln('}')
 
@@ -6846,7 +6882,7 @@ fn (mut g Gen) write_types(symbols []&ast.TypeSymbol) {
 		}
 		if sym.kind == .none && (!g.pref.skip_unused || g.table.used_features.used_none > 0) {
 			g.type_definitions.writeln('struct none {')
-			g.type_definitions.writeln('\tEMPTY_STRUCT_DECLARATION;')
+			g.type_definitions.writeln('\tE_STRUCT_DECL;')
 			g.type_definitions.writeln('};')
 			g.typedefs.writeln('typedef struct none none;')
 		}
@@ -8530,7 +8566,7 @@ fn (mut g Gen) check_noscan(elem_typ ast.Type) string {
 
 // vint2int rename `_vint_t` to `int`
 fn vint2int(name string) string {
-	$if new_int ? && (arm64 || amd64 || rv64 || s390x || ppc64le || loongarch64) {
+	$if new_int ? && x64 {
 		if name == ast.int_type_name {
 			return 'int'
 		}
@@ -8574,6 +8610,41 @@ fn determine_integer_literal_type(node ast.IntegerLiteral) ast.Type {
 			// If sign bit is clear, it's a signed 64-bit integer (i64)
 			// Otherwise, it's an unsigned 64-bit integer (u64)
 			return if sign_bit_clear { ast.i64_type } else { ast.u64_type }
+		}
+	}
+}
+
+fn get_overflow_fn_type(typ ast.Type) ast.Type {
+	return match typ {
+		ast.int_type {
+			$if new_int ? && x64 {
+				ast.i64_type
+			} $else {
+				ast.i32_type
+			}
+		}
+		ast.int_literal_type {
+			ast.i64_type
+		}
+		ast.rune_type {
+			ast.u32_type
+		}
+		ast.isize_type {
+			$if x64 {
+				ast.i64_type
+			} $else {
+				ast.i32_type
+			}
+		}
+		ast.usize_type {
+			$if x64 {
+				ast.u64_type
+			} $else {
+				ast.u32_type
+			}
+		}
+		else {
+			typ
 		}
 	}
 }

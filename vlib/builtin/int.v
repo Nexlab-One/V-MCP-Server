@@ -48,16 +48,8 @@ pub const max_i32 = i32(2147483647)
 pub const min_i64 = i64(-9223372036854775807 - 1)
 pub const max_i64 = i64(9223372036854775807)
 
-pub const min_int = $if new_int ? && (arm64 || amd64 || rv64 || s390x || ppc64le || loongarch64) {
-	int(min_i64)
-} $else {
-	int(min_i32)
-}
-pub const max_int = $if new_int ? && (arm64 || amd64 || rv64 || s390x || ppc64le || loongarch64) {
-	int(max_i64)
-} $else {
-	int(max_i32)
-}
+pub const min_int = $if new_int ? && x64 { int(min_i64) } $else { int(min_i32) }
+pub const max_int = $if new_int ? && x64 { int(max_i64) } $else { int(max_i32) }
 
 pub const min_u8 = u8(0)
 pub const max_u8 = u8(255)
@@ -80,6 +72,17 @@ fn (nn int) str_l(max int) string {
 		mut d := 0
 		if n == 0 {
 			return '0'
+		}
+
+		// overflow protect
+		$if new_int ? && x64 {
+			if n == min_i64 {
+				return '-9223372036854775808'
+			}
+		} $else {
+			if n == min_i32 {
+				return '-2147483648'
+			}
 		}
 
 		mut is_neg := false

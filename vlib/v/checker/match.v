@@ -266,11 +266,17 @@ fn (mut c Checker) match_expr(mut node ast.MatchExpr) ast.Type {
 				} else {
 					node.expected_type
 				}
-				expr_type := c.unwrap_generic(if stmt.expr is ast.CallExpr {
-					stmt.typ
+				branch.is_comptime_err = stmt.expr is ast.ComptimeCall
+					&& stmt.expr.kind in [.compile_error, .compile_warn]
+				expr_type := if branch.is_comptime_err {
+					c.expected_type
 				} else {
-					c.expr(mut stmt.expr)
-				})
+					c.unwrap_generic(if stmt.expr is ast.CallExpr {
+						stmt.typ
+					} else {
+						c.expr(mut stmt.expr)
+					})
+				}
 				unwrapped_expected_type := c.unwrap_generic(node.expected_type)
 				must_be_option = must_be_option || expr_type == ast.none_type
 				stmt.typ = expr_type
@@ -401,8 +407,7 @@ fn (mut c Checker) match_expr(mut node ast.MatchExpr) ast.Type {
 										}
 									}
 									.int {
-										$if new_int ? && (arm64 || amd64 || rv64
-											|| s390x || ppc64le || loongarch64) {
+										$if new_int ? && x64 {
 											if !(num >= min_i64 && num <= max_i64) {
 												needs_explicit_cast = true
 											}
@@ -435,14 +440,25 @@ fn (mut c Checker) match_expr(mut node ast.MatchExpr) ast.Type {
 					c.error('`match` expression requires an expression as the last statement of every branch',
 						stmt.pos)
 				}
+			} else if c.inside_return && mut stmt is ast.Return && ret_type == ast.void_type {
+				ret_type = if stmt.types.len > 0 { stmt.types[0] } else { c.expected_type }
 			}
 		}
 		first_iteration = false
-		if has_return := c.has_return(branch.stmts) {
-			if has_return {
+		if node.is_comptime {
+			// branches may not have been processed by c.stmts()
+			if has_top_return(branch.stmts) {
 				nbranches_with_return++
 			} else {
 				nbranches_without_return++
+			}
+		} else {
+			if has_return := c.has_return(branch.stmts) {
+				if has_return {
+					nbranches_with_return++
+				} else {
+					nbranches_without_return++
+				}
 			}
 		}
 	}

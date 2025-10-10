@@ -32,24 +32,32 @@ enum CipherMode {
 	original
 }
 
+// Configuration options
+@[params]
+pub struct Options {
+pub mut:
+	// currently, used for XChaCha20 construct
+	use_64bit_counter bool
+}
+
 // encrypt encrypts plaintext bytes with ChaCha20 cipher instance with provided key and nonce.
 // It was a thin wrapper around two supported nonce size, ChaCha20 with 96 bits
 // and XChaCha20 with 192 bits nonce. Internally, encrypt start with 0's counter value.
 // If you want more control, use Cipher instance and setup the counter by your self.
-pub fn encrypt(key []u8, nonce []u8, plaintext []u8) ![]u8 {
-	mut stream := new_stream(key, nonce)!
+pub fn encrypt(key []u8, nonce []u8, plaintext []u8, opt Options) ![]u8 {
+	mut stream := new_stream_with_options(key, nonce, opt)!
 	mut dst := []u8{len: plaintext.len}
-	stream.keystream_full(mut dst, plaintext)
+	stream.keystream_full(mut dst, plaintext)!
 	unsafe { stream.reset() }
 	return dst
 }
 
 // decrypt does reverse of encrypt operation by decrypting ciphertext with ChaCha20 cipher
 // instance with provided key and nonce.
-pub fn decrypt(key []u8, nonce []u8, ciphertext []u8) ![]u8 {
-	mut stream := new_stream(key, nonce)!
+pub fn decrypt(key []u8, nonce []u8, ciphertext []u8, opt Options) ![]u8 {
+	mut stream := new_stream_with_options(key, nonce)!
 	mut dst := []u8{len: ciphertext.len}
-	stream.keystream_full(mut dst, ciphertext)
+	stream.keystream_full(mut dst, ciphertext)!
 	unsafe { stream.reset() }
 	return dst
 }
@@ -71,8 +79,8 @@ mut:
 // with support for 64-bit counter, use 8 bytes length nonce's instead
 // If 24 bytes of nonce was provided, the XChaCha20 construction will be used.
 // It returns new ChaCha20 cipher instance or an error if key or nonce have any other length.
-pub fn new_cipher(key []u8, nonce []u8) !&Cipher {
-	stream := new_stream(key, nonce)!
+pub fn new_cipher(key []u8, nonce []u8, opt Options) !&Cipher {
+	stream := new_stream_with_options(key, nonce, opt)!
 	return &Cipher{
 		Stream: stream
 	}
@@ -91,62 +99,60 @@ pub fn (mut c Cipher) xor_key_stream(mut dst []u8, src []u8) {
 	if dst.len < src.len {
 		panic('chacha20/chacha: dst buffer is to small')
 	}
-
-	mut idx := 0
-	mut src_len := src.len
-	// check for counter overflow
-	num_blocks := (u64(src_len) + block_size - 1) / block_size
-	if c.Stream.check_ctr(num_blocks) {
-		panic('chacha20: internal counter overflow')
-	}
-
-	dst = unsafe { dst[..src_len] }
-
+	dst = unsafe { dst[..src.len] }
 	if subtle.inexact_overlap(dst, src) {
 		panic('chacha20: invalid buffer overlap')
 	}
+	// index of position within src bytes
+	mut idx := 0
 
-	// We adapt and ports the go version here
-	// First, drain any remaining key stream
+	// First, try to drain any remaining key stream from internal buffer
 	if c.length != 0 {
 		// remaining keystream on internal buffer
 		mut kstream := c.block[block_size - c.length..]
-		if src_len < kstream.len {
-			kstream = unsafe { kstream[..src_len] }
+		if src.len < kstream.len {
+			kstream = unsafe { kstream[..src.len] }
 		}
+		// xors every bytes in src with bytes from key stream and stored into dst
 		for i, b in kstream {
 			dst[idx + i] = src[idx + i] ^ b
 		}
-		// updates the idx for dst and src
+		// updates position and internal buffer length.
+		// when c.length reaches the block_size, we reset it for future use.
 		c.length -= kstream.len
 		idx += kstream.len
-		src_len -= kstream.len
+		if c.length == block_size {
+			unsafe { c.block.reset() }
+			c.length = 0
+		}
+	}
+	// process for remaining unprocessed src bytes
+	mut remains := unsafe { src[idx..] }
+	nr_blocks := remains.len / block_size
+
+	// process for full block_size-d message
+	for i := 0; i < nr_blocks; i++ {
+		// for every block_sized message, we generates 64-bytes block key stream
+		// and then xor-ing this block with generated key stream
+		block := unsafe { remains[i * block_size..(i + 1) * block_size] }
+		ks := c.keystream() or { panic(err) }
+		for j, b in ks {
+			dst[idx + j] = block[j] ^ b
+		}
+		// updates position
+		idx += block_size
 	}
 
-	// take the most full bytes of multiples block_size from the src,
-	// build the keystream from the cipher's state and stores the result
-	// into dst
-	full := src_len - src_len % block_size
-	if full > 0 {
-		src_block := unsafe { src[idx..idx + full] }
-		c.Stream.keystream_with_blocksize(mut dst[idx..idx + full], src_block)
-	}
-	idx += full
-	src_len -= full
-
-	// If we have a partial block, pad it for chacha20_block_generic, and
-	// keep the leftover keystream for the next invocation.
-	if src_len > 0 {
-		// Make sure, internal buffer cleared or the old garbaged data from previous call still there
-		// See the issue at https://github.com/vlang/v/issues/24043
-		unsafe { c.block.reset() } //  = []u8{len: block_size}
-		// copy the last src block to internal buffer, and performs
-		// chacha20_block_generic on this buffer, and stores into remaining dst
-		_ := copy(mut c.block, src[idx..])
-		c.Stream.keystream_with_blocksize(mut c.block, c.block)
-		n := copy(mut dst[idx..], c.block)
-		// the length of remaining bytes of unprocessed keystream
-		c.length = block_size - n
+	// process for remaining partial block
+	if remains.len % block_size != 0 {
+		last_block := unsafe { remains[nr_blocks * block_size..] }
+		// generates one 64-bytes keystream block
+		c.block = c.keystream() or { panic(err) }
+		for i, b in last_block {
+			dst[idx + i] = b ^ c.block[i]
+		}
+		c.length = block_size - last_block.len
+		idx += last_block.len
 	}
 }
 
@@ -156,18 +162,18 @@ pub fn (mut c Cipher) xor_key_stream(mut dst []u8, src []u8) {
 // Its added to allow `chacha20poly1305` modules to work without key stream fashion.
 // TODO: integrates it with the rest
 @[direct_array_access]
-pub fn (mut c Cipher) encrypt(mut dst []u8, src []u8) {
+pub fn (mut c Cipher) encrypt(mut dst []u8, src []u8) ! {
 	if src.len == 0 {
 		return
 	}
 	if dst.len < src.len {
-		panic('chacha20: dst buffer is to small')
+		return error('chacha20: dst buffer is to small')
 	}
 	if subtle.inexact_overlap(dst, src) {
-		panic('chacha20: invalid buffer overlap')
+		return error('chacha20: invalid buffer overlap')
 	}
 
-	c.Stream.keystream_full(mut dst, src)
+	c.Stream.keystream_full(mut dst, src)!
 }
 
 // free the resources taken by the Cipher `c`. Dont use cipher after .free call
@@ -181,7 +187,9 @@ pub fn (mut c Cipher) free() {
 	}
 }
 
-// reset quickly sets all Cipher's fields to default value
+// reset quickly sets all Cipher's fields to default value.
+// This method will be deprecated.
+@[deprecated_after: '2025-11-30']
 @[unsafe]
 pub fn (mut c Cipher) reset() {
 	c.Stream.reset()
@@ -196,31 +204,19 @@ pub fn (mut c Cipher) set_counter(ctr u64) {
 	c.Stream.set_ctr(ctr)
 }
 
+// counter returns a current underlying counter value, as u64.
+pub fn (c Cipher) counter() u64 {
+	return c.Stream.ctr()
+}
+
 // rekey resets internal Cipher's state and reinitializes state with the provided key and nonce
 pub fn (mut c Cipher) rekey(key []u8, nonce []u8) ! {
 	unsafe { c.reset() }
-	stream := new_stream(key, nonce)!
-	c.Stream = stream
-}
-
-// Helpers
-//
-
-// derive_xchacha20_key_nonce derives a new key and nonces for extended
-// variant of Standard IETF ChaCha20 variant. Its separated for simplify the access.
-@[direct_array_access; inline]
-fn derive_xchacha20_key_nonce(key []u8, nonce []u8) !([]u8, []u8) {
-	// Its only for x_nonce_size
-	if nonce.len != x_nonce_size {
-		return error('Bad nonce size for derive_xchacha20_key_nonce')
+	// we use c.Stream.mode info to get 64-bit counter capability
+	w64 := if c.mode == .original { true } else { false }
+	opt := Options{
+		use_64bit_counter: w64
 	}
-	// derives a new key based on xchacha20 construction
-	// first 16 bytes of nonce used to derive the key
-	new_key := xchacha20(key, nonce[0..16])!
-	mut new_nonce := []u8{len: nonce_size}
-	// and the last of 8 bytes of nonce copied into new_nonce to build
-	// nonce_size length of new_nonce
-	_ := copy(mut new_nonce[4..12], nonce[16..24])
-
-	return new_key, new_nonce
+	stream := new_stream_with_options(key, nonce, opt)!
+	c.Stream = stream
 }
