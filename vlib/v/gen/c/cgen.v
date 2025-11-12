@@ -154,6 +154,7 @@ mut:
 	inside_for_c_stmt         bool
 	inside_cast_in_heap       int // inside cast to interface type in heap (resolve recursive calls)
 	inside_cast               bool
+	inside_sumtype_cast       bool
 	inside_selector           bool
 	inside_selector_deref     bool // indicates if the inside selector was already dereferenced
 	inside_memset             bool
@@ -171,12 +172,12 @@ mut:
 	unsafe_level              int
 	ternary_names             map[string]string
 	ternary_level_names       map[string][]string
-	arraymap_set_pos          int      // map or array set value position
-	stmt_path_pos             []int    // positions of each statement start, for inserting C statements before the current statement
-	skip_stmt_pos             bool     // for handling if expressions + autofree (since both prepend C statements)
-	left_is_opt               bool     // left hand side on assignment is an option
-	right_is_opt              bool     // right hand side on assignment is an option
-	assign_ct_type            ast.Type // left hand side resolved comptime type
+	arraymap_set_pos          int              // map or array set value position
+	stmt_path_pos             []int            // positions of each statement start, for inserting C statements before the current statement
+	skip_stmt_pos             bool             // for handling if expressions + autofree (since both prepend C statements)
+	left_is_opt               bool             // left hand side on assignment is an option
+	right_is_opt              bool             // right hand side on assignment is an option
+	assign_ct_type            map[int]ast.Type // left hand side resolved comptime type
 	indent                    int
 	empty_line                bool
 	assign_op                 token.Kind // *=, =, etc (for array_set)
@@ -248,7 +249,7 @@ mut:
 	expected_cast_type  ast.Type // for match expr of sumtypes
 	expected_arg_mut    bool     // generating a mutable fn parameter
 	or_expr_return_type ast.Type // or { 0, 1 } return type
-	anon_fn             bool
+	anon_fn             &ast.AnonFn
 	tests_inited        bool
 	has_main            bool
 	// main_fn_decl_node  ast.FnDecl
@@ -346,6 +347,7 @@ pub fn gen(files []&ast.File, mut table ast.Table, pref_ &pref.Preferences) GenO
 		table:                table
 		pref:                 pref_
 		fn_decl:              unsafe { nil }
+		anon_fn:              unsafe { nil }
 		is_autofree:          pref_.autofree
 		indent:               -1
 		module_built:         module_built
@@ -845,6 +847,7 @@ fn cgen_process_one_file_cb(mut p pool.PoolProcessor, idx int, wid int) &Gen {
 		table:                 global_g.table
 		pref:                  global_g.pref
 		fn_decl:               unsafe { nil }
+		anon_fn:               unsafe { nil }
 		indent:                -1
 		module_built:          global_g.module_built
 		timers:                util.new_timers(
@@ -2546,6 +2549,7 @@ fn (mut g Gen) stmt(node ast.Stmt) {
 				}
 			}
 			g.stmts(node.stmts)
+			g.write_defer_stmts(node.scope, false, node.pos)
 			g.writeln('}')
 			if node.is_unsafe {
 				g.unsafe_level--
@@ -2652,7 +2656,9 @@ fn (mut g Gen) stmt(node ast.Stmt) {
 		ast.DeferStmt {
 			mut defer_stmt := node
 			defer_stmt.ifdef = g.defer_ifdef
-			g.writeln('${g.defer_flag_var(defer_stmt)} = true;')
+			if defer_stmt.mode == .function {
+				g.writeln('${g.defer_flag_var(defer_stmt)} = true;')
+			}
 			g.defer_stmts << defer_stmt
 		}
 		ast.EnumDecl {
@@ -2757,30 +2763,6 @@ fn (mut g Gen) stmt(node ast.Stmt) {
 	}
 	// TODO: If we have temporary string exprs to free after this statement, do it. e.g.:
 	// `foo('a' + 'b')` => `tmp := 'a' + 'b'; foo(tmp); string_free(&tmp);`
-}
-
-fn (mut g Gen) write_defer_stmts() {
-	for i := g.defer_stmts.len - 1; i >= 0; i-- {
-		defer_stmt := g.defer_stmts[i]
-		if !g.pref.is_prod {
-			g.writeln('// Defer begin')
-		}
-		g.writeln('if (${g.defer_flag_var(defer_stmt)}) {')
-
-		//		g.indent++
-		if defer_stmt.ifdef.len > 0 {
-			g.writeln(defer_stmt.ifdef)
-			g.stmts(defer_stmt.stmts)
-			g.writeln2('', '#endif')
-		} else {
-			g.stmts(defer_stmt.stmts)
-		}
-		//		g.indent--
-		g.writeln('}')
-		if !g.pref.is_prod {
-			g.writeln('// Defer end')
-		}
-	}
 }
 
 struct SumtypeCastingFn {
@@ -2947,7 +2929,7 @@ fn (mut g Gen) call_cfn_for_casting_expr(fname string, expr ast.Expr, exp ast.Ty
 				}
 				old_inside_smartcast := g.inside_smartcast
 				g.inside_smartcast = true
-				defer {
+				defer(fn) {
 					g.inside_smartcast = old_inside_smartcast
 				}
 			} else {
@@ -2966,10 +2948,13 @@ fn (mut g Gen) call_cfn_for_casting_expr(fname string, expr ast.Expr, exp ast.Ty
 			ast.void_type)
 		g.write(g.type_default(ctyp))
 	} else {
+		old_inside_sumtype_cast := g.inside_sumtype_cast
+		g.inside_sumtype_cast = true
 		old_left_is_opt := g.left_is_opt
 		g.left_is_opt = !exp.has_flag(.option)
 		g.expr(expr)
 		g.left_is_opt = old_left_is_opt
+		g.inside_sumtype_cast = old_inside_sumtype_cast
 	}
 	if is_sumtype_cast {
 		// the `_to_sumtype_` family of functions last `is_mut` param
@@ -4459,6 +4444,9 @@ fn (mut g Gen) selector_expr(node ast.SelectorExpr) {
 				if name !in g.anon_fns {
 					g.anon_fns << name
 					g.gen_closure_fn(expr_styp, m, name)
+					if g.pref.no_closures {
+						g.error('a closure was generated for m.name: ${m.name}', node.pos)
+					}
 				}
 			}
 			g.write('builtin__closure__closure_create(${name}, ')
@@ -5027,6 +5015,7 @@ fn (mut g Gen) lock_expr(node ast.LockExpr) {
 	if node.is_expr {
 		g.writeln(';')
 	}
+	g.write_defer_stmts(node.scope, false, node.pos)
 	g.writeln('}')
 	g.unlock_locks()
 	if node.is_expr {
@@ -5273,6 +5262,7 @@ fn (mut g Gen) select_expr(node ast.SelectExpr) {
 	g.writeln('builtin__array_free(&${chan_array});')
 	mut i := 0
 	for j in 0 .. node.branches.len {
+		branch := node.branches[j]
 		if j > 0 {
 			g.write('} else ')
 		}
@@ -5288,7 +5278,8 @@ fn (mut g Gen) select_expr(node ast.SelectExpr) {
 			}
 			i++
 		}
-		g.stmts(node.branches[j].stmts)
+		g.stmts(branch.stmts)
+		g.write_defer_stmts(branch.scope, false, branch.pos)
 	}
 	g.writeln('}')
 	if is_expr {
@@ -5322,7 +5313,7 @@ fn (mut g Gen) ident(node ast.Ident) {
 			styp := g.base_type(node.obj.typ)
 			g.write('(*(${styp}*)')
 
-			defer {
+			defer(fn) {
 				g.write('.data)')
 			}
 		}
@@ -6020,6 +6011,7 @@ fn (mut g Gen) branch_stmt(node ast.BranchStmt) {
 			}
 			else {}
 		}
+		g.write_defer_stmts(node.scope, false, node.pos)
 		// continue or break
 		if g.is_autofree && !g.is_builtin_mod {
 			g.trace_autofree('// free before continue/break')
@@ -6072,7 +6064,7 @@ fn (mut g Gen) return_stmt(node ast.Return) {
 		&& !fn_ret_type.has_option_or_result()
 	mut has_semicolon := false
 	if exprs_len == 0 {
-		g.write_defer_stmts_when_needed()
+		g.write_defer_stmts_when_needed(node.scope, true, node.pos)
 		if fn_return_is_option || fn_return_is_result {
 			styp := g.styp(fn_ret_type)
 			if g.is_autofree {
@@ -6100,10 +6092,10 @@ fn (mut g Gen) return_stmt(node ast.Return) {
 			g.write('${ret_typ} ${tmpvar} = ')
 			g.expr(expr0)
 			g.writeln(';')
-			g.write_defer_stmts_when_needed()
+			g.write_defer_stmts_when_needed(node.scope, true, node.pos)
 			g.writeln('return ${tmpvar};')
 		} else {
-			g.write_defer_stmts_when_needed()
+			g.write_defer_stmts_when_needed(node.scope, true, node.pos)
 			g.write('return ')
 			g.expr(expr0)
 			g.writeln(';')
@@ -6126,7 +6118,7 @@ fn (mut g Gen) return_stmt(node ast.Return) {
 				g.write('${ret_typ} ${test_error_var} = ')
 				g.gen_option_error(fn_ret_type, expr0)
 				g.writeln(';')
-				g.write_defer_stmts_when_needed()
+				g.write_defer_stmts_when_needed(node.scope, true, node.pos)
 				g.gen_failing_return_error_for_test_fn(node, test_error_var)
 				return
 			}
@@ -6149,7 +6141,7 @@ fn (mut g Gen) return_stmt(node ast.Return) {
 						}
 					}
 				}
-				g.write_defer_stmts_when_needed()
+				g.write_defer_stmts_when_needed(node.scope, true, node.pos)
 				g.writeln('return ${tmpvar};')
 			}
 			return
@@ -6165,7 +6157,7 @@ fn (mut g Gen) return_stmt(node ast.Return) {
 				g.write('${ret_typ} ${test_error_var} = ')
 				g.gen_result_error(fn_ret_type, expr0)
 				g.writeln(';')
-				g.write_defer_stmts_when_needed()
+				g.write_defer_stmts_when_needed(node.scope, true, node.pos)
 				g.gen_failing_return_error_for_test_fn(node, test_error_var)
 				return
 			}
@@ -6177,7 +6169,7 @@ fn (mut g Gen) return_stmt(node ast.Return) {
 			g.gen_result_error(fn_ret_type, expr0)
 			g.writeln(';')
 			if use_tmp_var {
-				g.write_defer_stmts_when_needed()
+				g.write_defer_stmts_when_needed(node.scope, true, node.pos)
 				g.writeln('return ${tmpvar};')
 			}
 			return
@@ -6190,7 +6182,7 @@ fn (mut g Gen) return_stmt(node ast.Return) {
 			g.write('${ret_typ} ${tmpvar} = ')
 			g.expr(expr0)
 			g.writeln(';')
-			g.write_defer_stmts_when_needed()
+			g.write_defer_stmts_when_needed(node.scope, true, node.pos)
 			g.writeln('return ${tmpvar};')
 			return
 		}
@@ -6254,7 +6246,17 @@ fn (mut g Gen) return_stmt(node ast.Return) {
 			if expr !is ast.ArrayInit && g.table.final_sym(node.types[i]).kind == .array_fixed {
 				line := g.go_before_last_stmt().trim_space()
 				expr_styp := g.styp(node.types[i])
-				g.write('memcpy(&${tmpvar}.arg${arg_idx}, ')
+				g.write('memcpy(&')
+				if fn_return_is_result || fn_return_is_option {
+					g.write('((${styp}*)')
+				}
+				g.write('${tmpvar}')
+				if fn_return_is_result || fn_return_is_option {
+					g.write('.data)->')
+				} else {
+					g.write('.')
+				}
+				g.write('arg${arg_idx}, ')
 				if expr is ast.StructInit {
 					g.write('(${expr_styp})')
 				}
@@ -6282,12 +6284,10 @@ fn (mut g Gen) return_stmt(node ast.Return) {
 		g.write('}')
 		if fn_return_is_option {
 			g.writeln(' }, (${option_name}*)(&${tmpvar}), sizeof(${styp}));')
-			g.write_defer_stmts_when_needed()
-			g.write('return ${tmpvar}')
+			g.write_defer_stmts_when_needed(node.scope, true, node.pos)
 		} else if fn_return_is_result {
 			g.writeln(' }, (${result_name}*)(&${tmpvar}), sizeof(${styp}));')
-			g.write_defer_stmts_when_needed()
-			g.write('return ${tmpvar}')
+			g.write_defer_stmts_when_needed(node.scope, true, node.pos)
 		}
 		// Make sure to add our unpacks
 		if multi_unpack != '' {
@@ -6301,9 +6301,11 @@ fn (mut g Gen) return_stmt(node ast.Return) {
 			if !has_semicolon {
 				g.writeln(';')
 			}
-			g.write_defer_stmts_when_needed()
+			g.write_defer_stmts_when_needed(node.scope, true, node.pos)
 			g.writeln('return ${tmpvar};')
 			has_semicolon = true
+		} else if fn_return_is_option || fn_return_is_result {
+			g.write('return ${tmpvar}')
 		}
 	} else if exprs_len >= 1 {
 		if node.types.len == 0 {
@@ -6362,7 +6364,7 @@ fn (mut g Gen) return_stmt(node ast.Return) {
 				}
 				g.writeln(' }, (${option_name}*)(&${tmpvar}), sizeof(${styp}));')
 			}
-			g.write_defer_stmts_when_needed()
+			g.write_defer_stmts_when_needed(node.scope, true, node.pos)
 			if g.is_autofree {
 				g.detect_used_var_on_return(expr0)
 			}
@@ -6410,7 +6412,7 @@ fn (mut g Gen) return_stmt(node ast.Return) {
 				}
 				g.writeln(' }, (${result_name}*)(&${tmpvar}), sizeof(${styp}));')
 			}
-			g.write_defer_stmts_when_needed()
+			g.write_defer_stmts_when_needed(node.scope, true, node.pos)
 			if g.is_autofree {
 				g.detect_used_var_on_return(expr0)
 			}
@@ -6520,7 +6522,7 @@ fn (mut g Gen) return_stmt(node ast.Return) {
 		if use_tmp_var {
 			g.writeln(';')
 			has_semicolon = true
-			g.write_defer_stmts_when_needed()
+			g.write_defer_stmts_when_needed(node.scope, true, node.pos)
 			if !g.is_builtin_mod {
 				g.autofree_scope_vars(node.pos.pos - 1, node.pos.line_nr, true)
 			}
@@ -6609,7 +6611,8 @@ fn verror(s string) {
 
 @[noreturn]
 fn (g &Gen) error(s string, pos token.Pos) {
-	util.show_compiler_message('cgen error:', pos: pos, file_path: g.file.path, message: s)
+	file_path := if pos.file_idx < 0 { g.file.path } else { g.table.filelist[pos.file_idx] }
+	util.show_compiler_message('cgen error:', pos: pos, file_path: file_path, message: s)
 	exit(1)
 }
 
@@ -7234,7 +7237,7 @@ fn (mut g Gen) sort_structs(typesa []&ast.TypeSymbol) []&ast.TypeSymbol {
 }
 
 fn (mut g Gen) gen_or_block_stmts(cvar_name string, cast_typ string, stmts []ast.Stmt, return_type ast.Type,
-	is_option bool) {
+	is_option bool, scope &ast.Scope, pos token.Pos) {
 	g.indent++
 	for i, stmt in stmts {
 		if i == stmts.len - 1 {
@@ -7244,6 +7247,7 @@ fn (mut g Gen) gen_or_block_stmts(cvar_name string, cast_typ string, stmts []ast
 				|| expr_stmt.typ in [ast.none_type, ast.error_type]) {
 				// `return foo() or { error('failed') }`
 				if g.cur_fn != unsafe { nil } {
+					g.write_defer_stmts(scope, true, pos)
 					if g.cur_fn.return_type.has_flag(.result) {
 						g.write('return ')
 						g.gen_result_error(g.cur_fn.return_type, expr_stmt.expr)
@@ -7259,6 +7263,7 @@ fn (mut g Gen) gen_or_block_stmts(cvar_name string, cast_typ string, stmts []ast
 					g.write('${cvar_name} = ')
 					g.gen_option_error(return_type, expr_stmt.expr)
 					g.writeln(';')
+					g.write_defer_stmts(scope, false, pos)
 				} else if return_type == ast.rvoid_type {
 					// fn returns !, do not fill var.data
 					old_inside_opt_data := g.inside_opt_data
@@ -7315,6 +7320,7 @@ fn (mut g Gen) gen_or_block_stmts(cvar_name string, cast_typ string, stmts []ast
 						g.write(', sizeof(${cast_typ}))')
 					}
 					g.writeln(';')
+					g.write_defer_stmts(scope, return_wrapped, pos)
 					g.stmt_path_pos.delete_last()
 					if return_wrapped {
 						g.writeln('return ${cvar_name};')
@@ -7368,16 +7374,23 @@ fn (mut g Gen) or_block(var_name string, or_block ast.OrExpr, return_type ast.Ty
 		}
 
 		g.inside_or_block = true
-		defer {
+		defer(fn) {
 			g.inside_or_block = false
 		}
 		stmts := or_block.stmts
 		if stmts.len > 0 && stmts.last() is ast.ExprStmt && stmts.last().typ != ast.void_type {
-			g.gen_or_block_stmts(cvar_name, mr_styp, stmts, return_type, true)
+			g.gen_or_block_stmts(cvar_name, mr_styp, stmts, return_type, true, or_block.scope,
+				or_block.pos)
 		} else {
 			g.stmts(stmts)
-			if stmts.len > 0 && stmts.last() is ast.ExprStmt {
-				g.writeln(';')
+			if stmts.len > 0 {
+				stmt_last := stmts.last()
+				if stmt_last is ast.ExprStmt {
+					g.writeln(';')
+				}
+				if stmt_last !in [ast.Return, ast.BranchStmt] {
+					g.write_defer_stmts(or_block.scope, false, or_block.pos)
+				}
 			}
 		}
 		g.or_expr_return_type = ast.void_type
@@ -7385,6 +7398,7 @@ fn (mut g Gen) or_block(var_name string, or_block ast.OrExpr, return_type ast.Ty
 		|| (or_block.kind == .propagate_option && return_type.has_flag(.result)) {
 		if g.file.mod.name == 'main' && (g.fn_decl == unsafe { nil } || g.fn_decl.is_main) {
 			// In main(), an `opt()!` call is sugar for `opt() or { panic(err) }`
+			g.write_defer_stmts(or_block.scope, true, or_block.pos)
 			err_msg := 'IError_name_table[${cvar_name}${tmp_op}err._typ]._method_msg(${cvar_name}${tmp_op}err._object)'
 			if g.pref.is_debug {
 				paline, pafile, pamod, pafn := g.panic_debug_info(or_block.pos)
@@ -7399,7 +7413,7 @@ fn (mut g Gen) or_block(var_name string, or_block ast.OrExpr, return_type ast.Ty
 			// `opt() or { return err }`
 			// Since we *do* return, first we have to ensure that
 			// the deferred statements are generated.
-			g.write_defer_stmts()
+			g.write_defer_stmts(or_block.scope, true, or_block.pos)
 			// Now that option types are distinct we need a cast here
 			if g.fn_decl == unsafe { nil } || g.fn_decl.return_type == ast.void_type {
 				g.writeln('\treturn;')
@@ -7419,6 +7433,7 @@ fn (mut g Gen) or_block(var_name string, or_block ast.OrExpr, return_type ast.Ty
 	} else if or_block.kind == .propagate_option {
 		if g.file.mod.name == 'main' && (g.fn_decl == unsafe { nil } || g.fn_decl.is_main) {
 			// In main(), an `opt()?` call is sugar for `opt() or { panic(err) }`
+			g.write_defer_stmts(or_block.scope, true, or_block.pos)
 			err_msg := 'IError_name_table[${cvar_name}${tmp_op}err._typ]._method_msg(${cvar_name}${tmp_op}err._object)'
 			if g.pref.is_debug {
 				paline, pafile, pamod, pafn := g.panic_debug_info(or_block.pos)
@@ -7433,7 +7448,7 @@ fn (mut g Gen) or_block(var_name string, or_block ast.OrExpr, return_type ast.Ty
 			// `opt() or { return err }`
 			// Since we *do* return, first we have to ensure that
 			// the deferred statements are generated.
-			g.write_defer_stmts()
+			g.write_defer_stmts(or_block.scope, true, or_block.pos)
 			// Now that option types are distinct we need a cast here
 			if g.fn_decl == unsafe { nil } || g.fn_decl.return_type == ast.void_type {
 				g.writeln('\treturn;')
@@ -7573,8 +7588,8 @@ fn (mut g Gen) type_default_impl(typ_ ast.Type, decode_sumtype bool) string {
 		}
 		.map {
 			info := sym.map_info()
-			key_typ := g.table.sym(info.key_type)
-			hash_fn, key_eq_fn, clone_fn, free_fn := g.map_fn_ptrs(key_typ)
+			key_sym := g.table.sym(info.key_type)
+			hash_fn, key_eq_fn, clone_fn, free_fn := g.map_fn_ptrs(key_sym)
 			noscan_key := g.check_noscan(info.key_type)
 			noscan_value := g.check_noscan(info.value_type)
 			mut noscan := if noscan_key.len != 0 || noscan_value.len != 0 { '_noscan' } else { '' }
@@ -7588,7 +7603,7 @@ fn (mut g Gen) type_default_impl(typ_ ast.Type, decode_sumtype bool) string {
 			}
 			init_str := 'builtin__new_map${noscan}(sizeof(${g.styp(info.key_type)}), sizeof(${g.styp(info.value_type)}), ${hash_fn}, ${key_eq_fn}, ${clone_fn}, ${free_fn})'
 			if typ.has_flag(.shared_f) {
-				mtyp := '__shared__Map_${key_typ.cname}_${g.styp(info.value_type).replace('*',
+				mtyp := '__shared__Map_${key_sym.cname}_${g.styp(info.value_type).replace('*',
 					'_ptr')}'
 				return '(${mtyp}*)__dup_shared_map(&(${mtyp}){.mtx = {0}, .val =${init_str}}, sizeof(${mtyp}))'
 			} else {

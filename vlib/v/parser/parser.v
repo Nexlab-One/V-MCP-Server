@@ -11,6 +11,7 @@ import v.util
 import v.errors
 import os
 import hash.fnv1a
+import strings
 
 @[minify]
 pub struct Parser {
@@ -19,6 +20,7 @@ pub:
 mut:
 	file_base         string       // "hello.v"
 	file_path         string       // "/home/user/hello.v"
+	file_idx          i16          // file idx in the global table `filelist`
 	file_display_path string       // just "hello.v", when your current folder for the compilation is "/home/user/", otherwise the full path "/home/user/hello.v"
 	unique_prefix     string       // a hash of p.file_path, used for making anon fn generation unique
 	file_backend_mode ast.Language // .c for .c.v|.c.vv|.c.vsh files; .js for .js.v files, .amd64/.rv32/other arches for .amd64.v/.rv32.v/etc. files, .v otherwise.
@@ -61,6 +63,7 @@ mut:
 	inside_asm_template      bool
 	inside_asm               bool
 	inside_defer             bool
+	defer_mode               ast.DeferMode
 	inside_generic_params    bool // indicates if parsing between `<` and `>` of a method/function
 	inside_receiver_param    bool // indicates if parsing the receiver parameter inside the first `(` and `)` of a method
 	inside_struct_field_decl bool
@@ -114,7 +117,9 @@ mut:
 	generic_type_level       int  // to avoid infinite recursion segfaults due to compiler bugs in ensure_type_exists
 	main_already_defined     bool // TODO move to checker
 	is_vls                   bool
+	is_vls_skip_file         bool // in `vls` mode, skip parse and check for unrelated files, such as `vlib`
 	inside_import_section    bool
+	cur_comments             []ast.Comment // comments between other stmts
 pub mut:
 	scanner &scanner.Scanner = unsafe { nil }
 	table   &ast.Table       = unsafe { nil }
@@ -174,16 +179,17 @@ pub fn parse_text(text string, path string, mut table ast.Table, comments_mode s
 		eprintln('> ${@MOD}.${@FN} comments_mode: ${comments_mode:-20} | path: ${path:-20} | text: ${text}')
 	}
 	mut p := Parser{
-		scanner:  scanner.new_scanner(text, comments_mode, pref_)
-		table:    table
-		pref:     pref_
-		is_vls:   pref_.is_vls
-		scope:    &ast.Scope{
+		scanner:          scanner.new_scanner(text, comments_mode, pref_)
+		table:            table
+		pref:             pref_
+		is_vls:           pref_.is_vls
+		is_vls_skip_file: pref_.is_vls && path != pref_.path
+		scope:            &ast.Scope{
 			start_pos: 0
 			parent:    table.global_scope
 		}
-		errors:   []errors.Error{}
-		warnings: []errors.Warning{}
+		errors:           []errors.Error{}
+		warnings:         []errors.Warning{}
 	}
 	p.set_path(path)
 	mut res := p.parse()
@@ -255,19 +261,26 @@ pub fn parse_file(path string, mut table ast.Table, comments_mode scanner.Commen
 	$if trace_parse_file ? {
 		eprintln('> ${@MOD}.${@FN} comments_mode: ${comments_mode:-20} | path: ${path}')
 	}
+	mut file_idx := i16(table.filelist.index(path))
+	if file_idx == -1 {
+		file_idx = i16(table.filelist.len)
+		table.filelist << path
+	}
 	mut p := Parser{
-		scanner: scanner.new_scanner_file(path, comments_mode, pref_) or { panic(err) }
+		scanner: scanner.new_scanner_file(path, file_idx, comments_mode, pref_) or { panic(err) }
 		table:   table
 		pref:    pref_
 		// Only set vls mode if it's the file the user requested via `v -vls-mode file.v`
 		// Otherwise we'd be parsing entire stdlib in vls mode
-		is_vls:   pref_.is_vls && path == pref_.path
-		scope:    &ast.Scope{
+		is_vls:           pref_.is_vls && path == pref_.path
+		is_vls_skip_file: pref_.is_vls && path != pref_.path
+		scope:            &ast.Scope{
 			start_pos: 0
 			parent:    table.global_scope
 		}
-		errors:   []errors.Error{}
-		warnings: []errors.Warning{}
+		errors:           []errors.Error{}
+		warnings:         []errors.Warning{}
+		file_idx:         file_idx
 	}
 	p.set_path(path)
 	res := p.parse()
@@ -309,7 +322,9 @@ pub fn (mut p Parser) parse() &ast.File {
 	}
 	for {
 		if p.tok.kind == .eof {
-			p.check_unused_imports()
+			if !p.is_vls_skip_file {
+				p.check_unused_imports()
+			}
 			break
 		}
 		stmt := p.top_stmt()
@@ -637,6 +652,13 @@ fn (p &Parser) trace_parser(label string) {
 fn (mut p Parser) top_stmt() ast.Stmt {
 	p.trace_parser('top_stmt')
 	for {
+		mut keep_cur_comments := false
+		defer {
+			// clear `cur_comments` after each statement, except a comment stmt
+			if !keep_cur_comments && p.pref.is_vls {
+				p.cur_comments.clear()
+			}
+		}
 		if p.tok.kind !in [.key_import, .comment, .dollar] {
 			// import section should only prepend by `import`, `comment` or `$if`.
 			p.inside_import_section = false
@@ -764,6 +786,7 @@ fn (mut p Parser) top_stmt() ast.Stmt {
 				return p.struct_decl(false)
 			}
 			.comment {
+				keep_cur_comments = true
 				return p.comment_stmt()
 			}
 			.semicolon {
@@ -775,6 +798,10 @@ fn (mut p Parser) top_stmt() ast.Stmt {
 			else {
 				return p.other_stmts(ast.empty_stmt)
 			}
+		}
+		// clear `cur_comments` after each statement, except a comment stmt
+		if !keep_cur_comments && p.pref.is_vls {
+			p.cur_comments.clear()
 		}
 		if p.should_abort {
 			break
@@ -870,6 +897,9 @@ fn (mut p Parser) comment() ast.Comment {
 
 fn (mut p Parser) comment_stmt() ast.ExprStmt {
 	comment := p.comment()
+	if p.pref.is_vls {
+		p.cur_comments << comment
+	}
 	return ast.ExprStmt{
 		expr: comment
 		pos:  comment.pos
@@ -916,6 +946,13 @@ fn (mut p Parser) stmt(is_top_level bool) ast.Stmt {
 		}
 	}
 
+	mut keep_cur_comments := false
+	defer {
+		if !keep_cur_comments && p.pref.is_vls {
+			p.cur_comments.clear()
+		}
+	}
+
 	p.trace_parser('stmt(${is_top_level})')
 	p.is_stmt_ident = p.tok.kind == .name
 	match p.tok.kind {
@@ -933,6 +970,7 @@ fn (mut p Parser) stmt(is_top_level bool) ast.Stmt {
 				pos.update_last_line(p.prev_tok.line_nr)
 				return ast.Block{
 					stmts: stmts
+					scope: p.scope.children.last()
 					pos:   pos
 				}
 			}
@@ -994,6 +1032,7 @@ fn (mut p Parser) stmt(is_top_level bool) ast.Stmt {
 			return p.for_stmt()
 		}
 		.comment {
+			keep_cur_comments = true
 			return p.comment_stmt()
 		}
 		.key_return {
@@ -1056,6 +1095,7 @@ fn (mut p Parser) stmt(is_top_level bool) ast.Stmt {
 			return ast.BranchStmt{
 				kind:  tok.kind
 				label: label
+				scope: p.scope
 				pos:   tok.pos()
 			}
 		}
@@ -1089,16 +1129,35 @@ fn (mut p Parser) stmt(is_top_level bool) ast.Stmt {
 		}
 		.key_defer {
 			if !p.inside_defer {
-				p.next()
 				spos := p.tok.pos()
+				p.next()
+				mut defer_mode := ast.DeferMode.scoped
+				if p.tok.kind == .lpar {
+					p.next()
+					mode_pos := p.tok.pos()
+					mode := p.check_name()
+					match mode {
+						'fn' {
+							defer_mode = .function
+						}
+						else {
+							return p.error_with_pos('unknown `defer` mode: `${mode}`',
+								mode_pos)
+						}
+					}
+					p.check(.rpar)
+				}
 				p.inside_defer = true
+				p.defer_mode = defer_mode
 				p.defer_vars = []ast.Ident{}
 				stmts := p.parse_block()
 				p.inside_defer = false
 				return ast.DeferStmt{
+					mode:       defer_mode
+					scope:      p.scope
 					stmts:      stmts
 					defer_vars: p.defer_vars.clone()
-					pos:        spos.extend_with_last_line(p.tok.pos(), p.prev_tok.line_nr)
+					pos:        spos.extend_with_last_line(p.prev_tok.pos(), p.prev_tok.line_nr)
 				}
 			} else {
 				return p.error_with_pos('`defer` blocks cannot be nested', p.tok.pos())
@@ -1196,10 +1255,9 @@ fn (mut p Parser) parse_multi_expr(is_top_level bool) ast.Stmt {
 
 	left := p.expr_list(p.inside_assign_rhs)
 
-	if !(p.inside_defer && p.tok.kind == .decl_assign) {
+	if !(p.inside_defer && p.defer_mode == .function && p.tok.kind == .decl_assign) {
 		defer_vars << p.defer_vars
 	}
-
 	p.defer_vars = defer_vars
 
 	left0 := left[0]
@@ -1304,10 +1362,11 @@ fn (mut p Parser) ident(language ast.Language) ast.Ident {
 	mut or_kind := ast.OrKind.absent
 	mut or_stmts := []ast.Stmt{}
 	mut or_pos := token.Pos{}
-	mut or_scope := &ast.Scope(unsafe { nil })
+	mut or_scope := ast.empty_scope
 
 	if allowed_cases && p.tok.kind == .question && p.peek_tok.kind != .lpar { // var?, not var?(
 		or_kind = ast.OrKind.propagate_option
+		or_scope = p.scope
 		p.check(.question)
 	} else if allowed_cases && p.tok.kind == .key_orelse {
 		or_kind = ast.OrKind.block
@@ -1559,11 +1618,6 @@ fn (mut p Parser) name_expr() ast.Expr {
 			// prepend the full import
 			mod = p.imports[p.tok.lit]
 		}
-		if p.pref.linfo.is_running {
-			// VLS autocomplete for module fns: `os...`
-			// TODO perf $if
-			// p.module_autocomplete(node)
-		}
 		line_nr := p.tok.line_nr
 		p.next()
 		p.check(.dot)
@@ -1617,16 +1671,17 @@ fn (mut p Parser) name_expr() ast.Expr {
 		name_w_mod := p.prepend_mod(name)
 		is_c_pointer_cast := language == .c && prev_tok_kind == .amp // `&C.abc(x)` is *always* a cast
 		is_c_type_cast := language == .c && (original_name in ['intptr_t', 'uintptr_t']
-			|| (name in p.table.type_idxs && original_name[0].is_capital()))
-		is_js_cast := language == .js && name.all_after_last('.')[0].is_capital()
+			|| (original_name[0].is_capital() && name in p.table.type_idxs))
+		is_capital_after_last_dot := name.all_after_last('.')[0].is_capital()
+		is_js_cast := language == .js && is_capital_after_last_dot
 		// type cast. TODO: finish
 		// if name in ast.builtin_type_names_to_idx {
 		// handle the easy cases first, then check for an already known V typename, not shadowed by a local variable
 		if (is_option || p.peek_tok.kind in [.lsbr, .lt, .lpar]) && (is_mod_cast
 			|| is_c_pointer_cast || is_c_type_cast || is_js_cast || is_generic_cast
-			|| (language == .v && name != '' && (name[0].is_capital() || (!known_var
-			&& (name in p.table.type_idxs || name_w_mod in p.table.type_idxs))
-			|| name.all_after_last('.')[0].is_capital()))) {
+			|| (language == .v && name != '' && (is_capital_after_last_dot
+			|| name[0].is_capital()
+			|| (!known_var && (name in p.table.type_idxs || name_w_mod in p.table.type_idxs))))) {
 			// MainLetter(x) is *always* a cast, as long as it is not `C.`
 			// TODO: handle C.stat()
 			start_pos := p.tok.pos()
@@ -1895,7 +1950,7 @@ fn (mut p Parser) index_expr(left ast.Expr, is_gated bool) ast.IndexExpr {
 		mut or_kind_high := ast.OrKind.absent
 		mut or_stmts_high := []ast.Stmt{}
 		mut or_pos_high := token.Pos{}
-		mut or_scope := &ast.Scope(unsafe { nil })
+		mut or_scope := ast.empty_scope
 
 		if !p.or_is_handled {
 			// a[..end] or {...}
@@ -1924,6 +1979,7 @@ fn (mut p Parser) index_expr(left ast.Expr, is_gated bool) ast.IndexExpr {
 			if p.tok.kind == .not {
 				or_pos_high = p.tok.pos()
 				or_kind_high = .propagate_result
+				or_scope = p.scope
 				p.next()
 			} else if p.tok.kind == .question {
 				p.error_with_pos('`?` for propagating errors from index expressions is no longer supported, use `!` instead of `?`',
@@ -1944,6 +2000,7 @@ fn (mut p Parser) index_expr(left ast.Expr, is_gated bool) ast.IndexExpr {
 			or_expr:  ast.OrExpr{
 				kind:  or_kind_high
 				stmts: or_stmts_high
+				scope: or_scope
 				pos:   or_pos_high
 			}
 			is_gated: is_gated
@@ -1965,7 +2022,7 @@ fn (mut p Parser) index_expr(left ast.Expr, is_gated bool) ast.IndexExpr {
 		mut or_kind_low := ast.OrKind.absent
 		mut or_stmts_low := []ast.Stmt{}
 		mut or_pos_low := token.Pos{}
-		mut or_scope := &ast.Scope(unsafe { nil })
+		mut or_scope := ast.empty_scope
 		if !p.or_is_handled {
 			// a[start..end] or {...}
 			if p.tok.kind == .key_orelse {
@@ -1994,6 +2051,7 @@ fn (mut p Parser) index_expr(left ast.Expr, is_gated bool) ast.IndexExpr {
 			if p.tok.kind == .not {
 				or_pos_low = p.tok.pos()
 				or_kind_low = .propagate_result
+				or_scope = p.scope
 				p.next()
 			} else if p.tok.kind == .question {
 				p.error_with_pos('`?` for propagating errors from index expressions is no longer supported, use `!` instead of `?`',
@@ -2015,6 +2073,7 @@ fn (mut p Parser) index_expr(left ast.Expr, is_gated bool) ast.IndexExpr {
 			or_expr:  ast.OrExpr{
 				kind:  or_kind_low
 				stmts: or_stmts_low
+				scope: or_scope
 				pos:   or_pos_low
 			}
 			is_gated: is_gated
@@ -2026,7 +2085,7 @@ fn (mut p Parser) index_expr(left ast.Expr, is_gated bool) ast.IndexExpr {
 	mut or_kind := ast.OrKind.absent
 	mut or_stmts := []ast.Stmt{}
 	mut or_pos := token.Pos{}
-	mut or_scope := &ast.Scope(unsafe { nil })
+	mut or_scope := ast.empty_scope
 	if !p.or_is_handled {
 		// a[i] or { ... }
 		if p.tok.kind == .key_orelse {
@@ -2048,6 +2107,7 @@ fn (mut p Parser) index_expr(left ast.Expr, is_gated bool) ast.IndexExpr {
 		if p.tok.kind == .not {
 			or_pos = p.tok.pos()
 			or_kind = .propagate_result
+			or_scope = p.scope
 			p.next()
 		} else if p.tok.kind == .question {
 			p.error_with_pos('`?` for propagating errors from index expressions is no longer supported, use `!` instead of `?`',
@@ -2061,6 +2121,7 @@ fn (mut p Parser) index_expr(left ast.Expr, is_gated bool) ast.IndexExpr {
 		or_expr:  ast.OrExpr{
 			kind:  or_kind
 			stmts: or_stmts
+			scope: or_scope
 			pos:   or_pos
 		}
 		is_gated: is_gated
@@ -2089,7 +2150,7 @@ fn (mut p Parser) dot_expr(left ast.Expr) ast.Expr {
 	mut field_name := ''
 	// check if the name is on the same line as the dot
 	if p.prev_tok.pos().line_nr == name_pos.line_nr || p.tok.kind != .name {
-		if p.is_vls {
+		if p.is_vls && p.tok.kind != .name {
 			if p.tok.kind in [.rpar, .rcbr] {
 				// Simplify the dot expression for VLS, so that the parser doesn't error
 				// `println(x.)` => `println(x)`
@@ -2109,7 +2170,7 @@ fn (mut p Parser) dot_expr(left ast.Expr) ast.Expr {
 			p.register_auto_import('builtin.closure')
 		}
 		p.open_scope()
-		defer {
+		defer(fn) {
 			p.close_scope()
 		}
 	}
@@ -2188,17 +2249,19 @@ fn (mut p Parser) dot_expr(left ast.Expr) ast.Expr {
 	mut or_kind := ast.OrKind.absent
 	mut or_stmts := []ast.Stmt{}
 	mut or_pos := token.Pos{}
-	mut or_scope := &ast.Scope(unsafe { nil })
+	mut or_scope := ast.empty_scope
 	if p.tok.kind == .key_orelse {
 		or_kind = .block
 		or_stmts, or_pos, or_scope = p.or_block(.with_err_var)
 	} else if p.tok.kind == .not {
 		or_kind = .propagate_result
 		or_pos = p.tok.pos()
+		or_scope = p.scope
 		p.next()
 	} else if p.tok.kind == .question {
 		or_kind = .propagate_option
 		or_pos = p.tok.pos()
+		or_scope = p.scope
 		p.next()
 	}
 	sel_expr := ast.SelectorExpr{
@@ -2530,7 +2593,8 @@ fn (mut p Parser) const_decl() ast.ConstDecl {
 			expr = p.expr(0)
 			p.inside_assign_rhs = old_inside_assign_rhs
 		}
-		if is_block {
+		// we need `end_comments` when in `vls` mode too
+		if is_block || p.pref.is_vls {
 			end_comments << p.eat_comments(same_line: true)
 		}
 		mut field := ast.ConstField{
@@ -2551,6 +2615,25 @@ fn (mut p Parser) const_decl() ast.ConstDecl {
 		}
 		fields << field
 		p.table.global_scope.register(field)
+		if p.pref.is_vls {
+			key := 'const_${full_name}'
+			// Fixme: because ConstDecl has no name, we can't access ConstDecl via name
+			// So the comment before the `const` keyword will be set to the first field's comment
+			// But as `vfmt` suggest every const should has a single line, no const block, this should be no problem
+			doc := if fields.len == 1 {
+				p.cur_comments << comments
+				p.keyword_comments_to_string(name, p.cur_comments) +
+					p.comments_to_string(end_comments)
+			} else {
+				p.comments_to_string(comments) + p.comments_to_string(end_comments)
+			}
+
+			val := ast.VlsInfo{
+				pos: field.pos
+				doc: doc
+			}
+			p.table.register_vls_info(key, val)
+		}
 		comments = []
 		if is_block {
 			end_comments = []
@@ -2565,7 +2648,7 @@ fn (mut p Parser) const_decl() ast.ConstDecl {
 	} else {
 		comments << p.eat_comments(same_line: true)
 	}
-	return ast.ConstDecl{
+	const_decl := ast.ConstDecl{
 		pos:          start_pos.extend_with_last_line(const_pos, p.prev_tok.line_nr)
 		fields:       fields
 		is_pub:       is_pub
@@ -2573,6 +2656,7 @@ fn (mut p Parser) const_decl() ast.ConstDecl {
 		is_block:     is_block
 		attrs:        attrs
 	}
+	return const_decl
 }
 
 fn (mut p Parser) return_stmt() ast.Return {
@@ -2582,6 +2666,7 @@ fn (mut p Parser) return_stmt() ast.Return {
 	mut comments := p.eat_comments()
 	if p.tok.kind == .rcbr || (p.tok.kind == .name && p.peek_tok.kind == .colon) {
 		return ast.Return{
+			scope:    p.scope
 			comments: comments
 			pos:      first_pos
 		}
@@ -2593,6 +2678,7 @@ fn (mut p Parser) return_stmt() ast.Return {
 	p.inside_assign_rhs = old_assign_rhs
 	end_pos := exprs.last().pos()
 	return ast.Return{
+		scope:    p.scope
 		exprs:    exprs
 		comments: comments
 		pos:      first_pos.extend(end_pos)
@@ -2725,7 +2811,7 @@ fn (mut p Parser) global_decl() ast.GlobalDecl {
 	if is_block {
 		p.check(.rpar)
 	}
-	return ast.GlobalDecl{
+	global_decl := ast.GlobalDecl{
 		pos:          start_pos.extend(p.prev_tok.pos())
 		mod:          p.mod
 		fields:       fields
@@ -2733,6 +2819,29 @@ fn (mut p Parser) global_decl() ast.GlobalDecl {
 		is_block:     is_block
 		attrs:        attrs
 	}
+	if p.pref.is_vls {
+		for i, f in fields {
+			mut key := 'global_${f.name}'
+			// Fixme: because GlobalDecl has no name, we can't access GlobalDecl via name
+			// So the comment before the `__global` keyword will be set to the first field's comment
+			doc := if i == 0 {
+				p.cur_comments << f.comments
+				p.keyword_comments_to_string(f.name, p.cur_comments)
+			} else {
+				p.comments_to_string(f.comments)
+			}
+			val := ast.VlsInfo{
+				pos: f.pos
+				doc: doc
+			}
+			p.table.register_vls_info(key, val)
+
+			// register another `module specific global`
+			key = 'global_${p.prepend_mod(f.name)}'
+			p.table.register_vls_info(key, val)
+		}
+	}
+	return global_decl
 }
 
 fn source_name(name string) string {
@@ -2750,6 +2859,11 @@ fn (mut p Parser) type_decl() ast.TypeDecl {
 		p.next()
 	}
 	p.check(.key_type)
+	mut comments_before_key_type := if p.pref.is_vls {
+		p.cur_comments.clone()
+	} else {
+		[]
+	}
 	end_pos := p.tok.pos()
 	decl_pos := start_pos.extend(end_pos)
 	name_pos := p.tok.pos()
@@ -2795,7 +2909,7 @@ fn (mut p Parser) type_decl() ast.TypeDecl {
 		type_pos = type_pos.extend(p.tok.pos())
 		comments = p.eat_comments(same_line: true)
 		p.attrs = []
-		return ast.FnTypeDecl{
+		fn_type_decl := ast.FnTypeDecl{
 			name:          fn_name
 			mod:           p.mod
 			is_pub:        is_pub
@@ -2807,6 +2921,16 @@ fn (mut p Parser) type_decl() ast.TypeDecl {
 			attrs:         attrs
 			is_markused:   attrs.contains('markused')
 		}
+		if p.pref.is_vls {
+			key := 'fntype_${fn_name}'
+			val := ast.VlsInfo{
+				pos: decl_pos
+				doc: p.keyword_comments_to_string(name, comments_before_key_type) +
+					p.comments_to_string(comments)
+			}
+			p.table.register_vls_info(key, val)
+		}
+		return fn_type_decl
 	}
 	sum_variants << p.parse_sum_type_variants()
 	// type SumType = Aaa | Bbb | Ccc
@@ -2834,6 +2958,7 @@ fn (mut p Parser) type_decl() ast.TypeDecl {
 				variants:      variant_types
 				is_generic:    generic_types.len > 0
 				generic_types: generic_types
+				name_pos:      name_pos
 			}
 			is_pub: is_pub
 		})
@@ -2855,6 +2980,15 @@ fn (mut p Parser) type_decl() ast.TypeDecl {
 			is_markused:   attrs.contains('markused')
 		}
 		p.table.register_sumtype(node)
+		if p.pref.is_vls {
+			key := 'sumtype_${p.prepend_mod(name)}'
+			val := ast.VlsInfo{
+				pos: node.pos
+				doc: p.keyword_comments_to_string(name, comments_before_key_type) +
+					p.comments_to_string(sum_variants[sum_variants.len - 1].end_comments)
+			}
+			p.table.register_vls_info(key, val)
+		}
 		return node
 	}
 	// type MyType = int
@@ -2881,6 +3015,7 @@ fn (mut p Parser) type_decl() ast.TypeDecl {
 		info:       ast.Alias{
 			parent_type: parent_type
 			language:    parent_language
+			name_pos:    name_pos
 		}
 		is_pub:     is_pub
 	})
@@ -2898,7 +3033,7 @@ fn (mut p Parser) type_decl() ast.TypeDecl {
 	}
 	comments = sum_variants[0].end_comments.clone()
 	p.attrs = []
-	return ast.AliasTypeDecl{
+	alias_type_decl := ast.AliasTypeDecl{
 		name:        name
 		is_pub:      is_pub
 		typ:         idx
@@ -2909,6 +3044,16 @@ fn (mut p Parser) type_decl() ast.TypeDecl {
 		is_markused: attrs.contains('markused')
 		attrs:       attrs
 	}
+	if p.pref.is_vls {
+		key := 'aliastype_${p.prepend_mod(name)}'
+		val := ast.VlsInfo{
+			pos: alias_type_decl.pos
+			doc: p.keyword_comments_to_string(name, comments_before_key_type) +
+				p.comments_to_string(comments)
+		}
+		p.table.register_vls_info(key, val)
+	}
+	return alias_type_decl
 }
 
 fn (mut p Parser) assoc() ast.Assoc {
@@ -3004,20 +3149,22 @@ fn (mut p Parser) unsafe_stmt() ast.Stmt {
 	if p.inside_unsafe && !p.inside_defer {
 		return p.error_with_pos('already inside `unsafe` block', pos)
 	}
+	p.inside_unsafe = true
+	p.open_scope() // needed in case of `unsafe {stmt}`
+	sc := p.scope
+	defer {
+		p.inside_unsafe = false
+		p.close_scope()
+	}
 	if p.tok.kind == .rcbr {
 		// `unsafe {}`
 		pos.update_last_line(p.tok.line_nr)
 		p.next()
 		return ast.Block{
+			scope:     sc
 			is_unsafe: true
 			pos:       pos
 		}
-	}
-	p.inside_unsafe = true
-	p.open_scope() // needed in case of `unsafe {stmt}`
-	defer {
-		p.inside_unsafe = false
-		p.close_scope()
 	}
 	stmt := p.stmt(false)
 	if p.tok.kind == .rcbr {
@@ -3048,6 +3195,7 @@ fn (mut p Parser) unsafe_stmt() ast.Stmt {
 	pos.update_last_line(p.tok.line_nr)
 	return ast.Block{
 		stmts:     stmts
+		scope:     sc
 		is_unsafe: true
 		pos:       pos
 	}
@@ -3090,7 +3238,7 @@ fn (mut p Parser) show(params ParserShowParams) {
 }
 
 fn (mut p Parser) add_defer_var(ident ast.Ident) {
-	if p.inside_defer {
+	if p.inside_defer && p.defer_mode == .function {
 		if !p.defer_vars.any(it.name == ident.name && it.mod == ident.mod)
 			&& ident.name !in ['err', 'it'] {
 			p.defer_vars << ident
@@ -3116,4 +3264,54 @@ fn (mut p Parser) skip_scope() {
 	if p.tok.kind == .rcbr {
 		p.next()
 	}
+}
+
+// keyword_comments_to_string will search line by line in `comments` for which line starts with `keyword`,
+// and then construct following comments into a string.
+// If no `keyword` found in each line of comments' beginning, then return ''
+// e.g
+// keyword = 'MyS'
+//
+// this is first comment
+// this is second comment
+// this is third comment
+// MyS is a struct ...
+// Note:...
+//
+// will return a string:
+// 'MyS is a struct ...\nNote:...'
+
+fn (mut p Parser) keyword_comments_to_string(keyword string, comments []ast.Comment) string {
+	mut sb := strings.new_builder(128)
+	mut is_found_keyword := false
+	for line in comments {
+		trim_line := if line.text.len > 0 && line.text[0] == 1 {
+			// skip ´\x01´
+			line.text[1..].trim_space()
+		} else {
+			line.text.trim_space()
+		}
+		if !is_found_keyword && trim_line.starts_with(keyword) {
+			is_found_keyword = true
+		}
+		if is_found_keyword {
+			sb.writeln(trim_line)
+		}
+	}
+	return sb.str()
+}
+
+// comments_to_string will construct all in `comments` into a string.
+fn (mut p Parser) comments_to_string(comments []ast.Comment) string {
+	mut sb := strings.new_builder(128)
+	for line in comments {
+		trim_line := if line.text.len > 0 && line.text[0] == 1 {
+			// skip ´\x01´
+			line.text[1..].trim_space()
+		} else {
+			line.text.trim_space()
+		}
+		sb.writeln(trim_line)
+	}
+	return sb.str()
 }

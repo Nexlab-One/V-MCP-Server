@@ -728,7 +728,11 @@ fn (mut w Walker) expr(node_ ast.Expr) {
 					} else if node.name in w.all_globals {
 						w.mark_global_as_used(node.name)
 					} else {
-						w.fn_by_name(node.name)
+						if (node.kind == .variable && node.obj is ast.Var && node.obj.is_used
+							&& node.obj.typ != 0 && w.table.type_kind(node.obj.typ) == .function)
+							|| (node.kind == .unresolved && node.name.contains('.')) {
+							w.fn_by_name(node.name)
+						}
 					}
 					if !w.uses_atomic && node.info is ast.IdentVar {
 						w.uses_atomic = node.info.typ.has_flag(.atomic_f)
@@ -840,7 +844,8 @@ fn (mut w Walker) expr(node_ ast.Expr) {
 			}
 			sym := w.table.sym(node.typ)
 			w.mark_by_sym(sym)
-			if !w.uses_memdup && sym.kind == .sum_type {
+			if !w.uses_memdup
+				&& (sym.kind == .sum_type || (sym.info is ast.Struct && sym.info.is_heap)) {
 				w.uses_memdup = true
 			}
 			if node.has_update_expr {
@@ -917,7 +922,7 @@ pub fn (mut w Walker) fn_decl(mut node ast.FnDecl) {
 	if w.level == 0 {
 		last_is_builtin_mod := w.is_builtin_mod
 		w.is_builtin_mod = node.mod in ['builtin', 'os', 'strconv', 'builtin.closure']
-		defer {
+		defer(fn) {
 			w.is_builtin_mod = last_is_builtin_mod
 		}
 	}
@@ -939,7 +944,7 @@ pub fn (mut w Walker) fn_decl(mut node ast.FnDecl) {
 	defer { w.is_direct_array_access = last_is_direct_array_access }
 	if w.trace_enabled {
 		w.level++
-		defer { w.level-- }
+		defer(fn) { w.level-- }
 		receiver_name := if node.is_method && node.receiver.typ != 0 {
 			w.table.type_to_str(node.receiver.typ) + '.'
 		} else {
@@ -1099,6 +1104,27 @@ pub fn (mut w Walker) call_expr(mut node ast.CallExpr) {
 			w.used_option++
 		} else if node.return_type.has_flag(.result) {
 			w.used_result++
+		}
+		if ((node.is_method && stmt.params.len > 1) || !node.is_method)
+			&& stmt.generic_names.len > 0 {
+			// mark concrete []T param as used
+			max_param_len := if node.is_method { stmt.params.len - 1 } else { stmt.params.len }
+			param_i := if node.is_method { 1 } else { 0 }
+			for concrete_type_list in w.table.fn_generic_types[fn_name] {
+				for k, concrete_type in concrete_type_list {
+					if k >= max_param_len {
+						break
+					}
+					param_typ := stmt.params[k + param_i].typ
+					if param_typ.has_flag(.generic) {
+						if w.table.type_kind(param_typ) == .array {
+							w.mark_by_type(w.table.find_or_register_array(concrete_type))
+						} else if param_typ.has_flag(.option) {
+							w.used_option++
+						}
+					}
+				}
+			}
 		}
 	}
 }

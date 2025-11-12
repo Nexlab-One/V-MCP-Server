@@ -403,13 +403,25 @@ fn (mut g Gen) infix_expr_eq_op(node ast.InfixExpr) {
 		old_inside_opt_or_res := g.inside_opt_or_res
 		g.inside_opt_or_res = true
 		if node.op == .eq {
-			g.write('!')
+			g.write('(')
+		} else {
+			g.write('!(')
 		}
-		g.write('memcmp(')
+		g.write('(')
 		g.expr(node.left)
-		g.write('.data, ')
+		g.write('.state == 2 && ')
 		g.expr(node.right)
-		g.write('.data, sizeof(${g.base_type(left_type)}))')
+		g.write('.state == 2) || (')
+		g.expr(node.left)
+		g.write('.state == ')
+		g.expr(node.right)
+		g.write('.state && ')
+		g.expr(node.left)
+		g.write('.state != 2 && !memcmp(&')
+		g.expr(node.left)
+		g.write('.data, &')
+		g.expr(node.right)
+		g.write('.data, sizeof(${g.base_type(left_type)}))))')
 		g.inside_opt_or_res = old_inside_opt_or_res
 	} else {
 		g.gen_plain_infix_expr(node)
@@ -1021,8 +1033,18 @@ fn (mut g Gen) infix_expr_arithmetic_op(node ast.InfixExpr) {
 // infix_expr_left_shift_op generates code for the `<<` operator
 // This can either be a value pushed into an array or a bit shift
 fn (mut g Gen) infix_expr_left_shift_op(node ast.InfixExpr) {
-	left := g.unwrap(node.left_type)
-	right := g.unwrap(node.right_type)
+	left_type := if node.left is ast.ComptimeSelector {
+		g.type_resolver.get_type(node.left)
+	} else {
+		node.left_type
+	}
+	right_type := if node.right is ast.ComptimeSelector {
+		g.type_resolver.get_type(node.right)
+	} else {
+		node.right_type
+	}
+	left := g.unwrap(left_type)
+	right := g.unwrap(right_type)
 	if left.unaliased_sym.kind == .array {
 		// arr << val
 		tmp_var := g.new_tmp_var()
@@ -1268,7 +1290,7 @@ fn (mut g Gen) gen_plain_infix_expr(node ast.InfixExpr) {
 		&& g.table.is_interface_var(node.left.obj) {
 		inside_interface_deref_old := g.inside_interface_deref
 		g.inside_interface_deref = true
-		defer {
+		defer(fn) {
 			g.inside_interface_deref = inside_interface_deref_old
 		}
 	}

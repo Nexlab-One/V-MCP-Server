@@ -460,6 +460,21 @@ fn (mut c Checker) check_basic(got ast.Type, expected ast.Type) bool {
 	if c.table.sumtype_has_variant(expected, ast.mktyp(got), false) {
 		return true
 	}
+	if exp_sym.kind == .placeholder && c.expected_type != ast.void_type {
+		base_type := c.table.find_type(exp_sym.ngname)
+		if base_type != 0 {
+			base_sym := c.table.sym(base_type)
+			if base_sym.kind == .sum_type && base_sym.info is ast.SumType {
+				base_info := base_sym.info as ast.SumType
+				for variant in base_info.variants {
+					variant_sym := c.table.sym(variant)
+					if variant_sym.ngname == got_sym.ngname {
+						return true
+					}
+				}
+			}
+		}
+	}
 	// struct
 	if exp_sym.kind == .struct && got_sym.kind == .struct {
 		if c.table.type_to_str(expected) == c.table.type_to_str(got) {
@@ -950,6 +965,37 @@ fn (mut c Checker) infer_struct_generic_types(typ ast.Type, node ast.StructInit)
 							}
 						}
 					}
+				} else if field_sym.info is ast.SumType {
+					for t in node.init_fields {
+						if ft.name == t.name && t.typ != 0 {
+							init_sym := c.table.sym(t.typ)
+							for variant in field_sym.info.variants {
+								variant_sym := c.table.sym(variant)
+								if variant_sym.name == init_sym.name {
+									if variant_sym.info is ast.Struct
+										&& variant_sym.info.generic_types.len > 0 {
+										if init_sym.info is ast.Struct
+											&& init_sym.info.concrete_types.len > 0 {
+											concrete_types << ast.mktyp(init_sym.info.concrete_types[0])
+											continue gname
+										}
+									} else {
+										for init_field in node.init_fields {
+											if init_field.name != t.name && init_field.typ != 0 {
+												field := sym.info.fields.filter(it.name == init_field.name)
+												if field.len > 0 {
+													if c.table.sym(field[0].typ).name == gt_name {
+														concrete_types << ast.mktyp(init_field.typ)
+														continue gname
+													}
+												}
+											}
+										}
+									}
+								}
+							}
+						}
+					}
 				}
 			}
 			c.error('could not infer generic type `${gt_name}` in generic struct `${sym.name}[${generic_names.join(', ')}]`',
@@ -1030,8 +1076,20 @@ fn (mut c Checker) infer_fn_generic_types(func &ast.Fn, mut node ast.CallExpr) {
 			arg := node.args[arg_i]
 			param_sym := c.table.sym(param.typ)
 
-			if param.typ.has_flag(.generic) && param_sym.name == gt_name {
+			if (param.typ.has_flag(.option) && arg.typ.has_flag(.option))
+				|| (param.typ.has_flag(.result) && arg.typ.has_flag(.result)) {
+				param_inner := param.typ.clear_option_and_result()
+				if param_inner.has_flag(.generic) && c.table.sym(param_inner).name == gt_name {
+					typ = arg.typ.clear_option_and_result()
+					if param_inner.nr_muls() > 0 && typ.nr_muls() > 0 {
+						typ = typ.set_nr_muls(0)
+					}
+				}
+			} else if param.typ.has_flag(.generic) && param_sym.name == gt_name {
 				typ = ast.mktyp(arg.typ)
+				if typ == ast.nil_type {
+					typ = ast.voidptr_type
+				}
 				sym := c.table.final_sym(arg.typ)
 				if sym.info is ast.FnType {
 					mut func_ := sym.info.func
@@ -1055,7 +1113,13 @@ fn (mut c Checker) infer_fn_generic_types(func &ast.Fn, mut node ast.CallExpr) {
 				}
 				// resolve &T &&T ...
 				if param.typ.nr_muls() > 0 && typ.nr_muls() > 0 {
-					typ = typ.set_nr_muls(0)
+					param_muls := param.typ.nr_muls()
+					arg_muls := typ.nr_muls()
+					typ = if arg_muls >= param_muls {
+						typ.set_nr_muls(arg_muls - param_muls)
+					} else {
+						typ.set_nr_muls(0)
+					}
 				}
 			} else if param.typ.has_flag(.generic) {
 				arg_typ := if c.table.sym(arg.typ).kind == .any {

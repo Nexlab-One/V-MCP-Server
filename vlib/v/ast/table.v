@@ -6,6 +6,7 @@ module ast
 
 import v.cflag
 import v.util
+import v.token
 
 @[heap; minify]
 pub struct UsedFeatures {
@@ -87,6 +88,7 @@ pub mut:
 	gostmts            int    // how many `go` statements there were in the parsed files.
 	// When table.gostmts > 0, __VTHREADS__ is defined, which can be checked with `$if threads {`
 	enum_decls        map[string]EnumDecl
+	vls_info          map[string]VlsInfo
 	module_deprecated map[string]bool
 	module_attrs      map[string][]Attr // module attributes
 	builtin_pub_fns   map[string]bool
@@ -102,12 +104,19 @@ pub mut:
 	new_int             bool              // use 64bit/32bit platform dependent `int`
 	new_int_fmt_fix     bool              // vfmt will fix `int` to `i32`
 	export_names        map[string]string // @[export] names
+	filelist            []string          // all files list
 }
 
 pub struct ComptTimeCondResult {
 pub mut:
 	val   bool
 	c_str string
+}
+
+pub struct VlsInfo {
+pub mut:
+	pos token.Pos
+	doc string // documentation
 }
 
 // used by vls to avoid leaks
@@ -898,7 +907,7 @@ fn (mut t Table) rewrite_already_registered_symbol(typ TypeSymbol, existing_idx 
 pub fn (mut t Table) register_sym(sym TypeSymbol) int {
 	mut idx := -2
 	$if trace_register_sym ? {
-		defer {
+		defer(fn) {
 			eprintln('>> register_sym: ${sym.name:-60} | idx: ${idx}')
 		}
 	}
@@ -928,6 +937,9 @@ pub fn (mut t Table) register_sym(sym TypeSymbol) int {
 		...sym
 	}
 	t.type_symbols[idx].idx = idx
+	if t.type_symbols[idx].ngname == '' {
+		t.type_symbols[idx].ngname = strip_generic_params(sym.name)
+	}
 	t.type_idxs[sym_name] = idx
 	return idx
 }
@@ -949,6 +961,11 @@ pub fn (mut t Table) register_anon_union(name string, sym_idx int) {
 
 pub fn (t &Table) known_type(name string) bool {
 	return t.type_idxs[name] != 0 || t.parsing_type == name || name in ['i32', 'byte']
+}
+
+@[inline]
+pub fn strip_generic_params(name string) string {
+	return name.all_before('[')
 }
 
 // start_parsing_type open the scope during the parsing of a type
@@ -1164,18 +1181,18 @@ pub fn (mut t Table) find_or_register_chan(elem_type Type, is_mut bool) int {
 	if existing_idx > 0 {
 		return existing_idx
 	}
-	// register
-	chan_typ := TypeSymbol{
+	chan_sym := TypeSymbol{
 		parent_idx: chan_type_idx
 		kind:       .chan
 		name:       name
 		cname:      cname
+		ngname:     strip_generic_params(name)
 		info:       Chan{
 			elem_type: elem_type
 			is_mut:    is_mut
 		}
 	}
-	return t.register_sym(chan_typ)
+	return t.register_sym(chan_sym)
 }
 
 pub fn (mut t Table) find_or_register_map(key_type Type, value_type Type) int {
@@ -1186,18 +1203,18 @@ pub fn (mut t Table) find_or_register_map(key_type Type, value_type Type) int {
 	if existing_idx > 0 {
 		return existing_idx
 	}
-	// register
-	map_typ := TypeSymbol{
+	map_sym := TypeSymbol{
 		parent_idx: map_type_idx
 		kind:       .map
 		name:       name
 		cname:      cname
+		ngname:     strip_generic_params(name)
 		info:       Map{
 			key_type:   key_type
 			value_type: value_type
 		}
 	}
-	return t.register_sym(map_typ)
+	return t.register_sym(map_sym)
 }
 
 pub fn (mut t Table) find_or_register_thread(return_type Type) int {
@@ -1208,17 +1225,17 @@ pub fn (mut t Table) find_or_register_thread(return_type Type) int {
 	if existing_idx > 0 {
 		return existing_idx
 	}
-	// register
-	thread_typ := TypeSymbol{
+	thread_sym := TypeSymbol{
 		parent_idx: thread_type_idx
 		kind:       .thread
 		name:       name
 		cname:      cname
+		ngname:     strip_generic_params(name)
 		info:       Thread{
 			return_type: return_type
 		}
 	}
-	return t.register_sym(thread_typ)
+	return t.register_sym(thread_sym)
 }
 
 pub fn (mut t Table) find_or_register_promise(return_type Type) int {
@@ -1236,6 +1253,7 @@ pub fn (mut t Table) find_or_register_promise(return_type Type) int {
 		kind:       .struct
 		name:       name
 		cname:      cname
+		ngname:     strip_generic_params(name)
 		info:       Struct{
 			concrete_types: [return_type, t.type_idxs['JS.Any']]
 		}
@@ -1259,6 +1277,7 @@ pub fn (mut t Table) find_or_register_array(elem_type Type) int {
 		kind:       .array
 		name:       name
 		cname:      cname
+		ngname:     strip_generic_params(name)
 		info:       Array{
 			nr_dims:   1
 			elem_type: elem_type
@@ -1286,10 +1305,11 @@ pub fn (mut t Table) find_or_register_array_fixed(elem_type Type, size int, size
 	cname := prefix + t.array_fixed_cname(elem_type, size)
 	// register
 	array_fixed_type := TypeSymbol{
-		kind:  .array_fixed
-		name:  name
-		cname: cname
-		info:  ArrayFixed{
+		kind:   .array_fixed
+		name:   name
+		cname:  cname
+		ngname: strip_generic_params(name)
+		info:   ArrayFixed{
 			elem_type: elem_type
 			size:      size
 			size_expr: size_expr
@@ -1321,16 +1341,16 @@ pub fn (mut t Table) find_or_register_multi_return(mr_typs []Type) int {
 	if existing_idx > 0 {
 		return existing_idx
 	}
-	// register
-	mr_type := TypeSymbol{
-		kind:  .multi_return
-		name:  name
-		cname: cname
-		info:  MultiReturn{
+	multireg_sym := TypeSymbol{
+		kind:   .multi_return
+		name:   name
+		cname:  cname
+		ngname: strip_generic_params(name)
+		info:   MultiReturn{
 			types: mr_typs
 		}
 	}
-	return t.register_sym(mr_type)
+	return t.register_sym(multireg_sym)
 }
 
 pub fn (mut t Table) find_or_register_fn_type(f Fn, is_anon bool, has_decl bool) int {
@@ -1349,14 +1369,53 @@ pub fn (mut t Table) find_or_register_fn_type(f Fn, is_anon bool, has_decl bool)
 		return existing_idx
 	}
 	return t.register_sym(
-		kind:  .function
-		name:  name
-		cname: cname
-		mod:   f.mod
-		info:  FnType{
+		kind:   .function
+		name:   name
+		cname:  cname
+		ngname: strip_generic_params(name)
+		mod:    f.mod
+		info:   FnType{
 			is_anon:  anon
 			has_decl: has_decl
 			func:     f
+		}
+	)
+}
+
+pub fn (mut t Table) find_or_register_generic_inst(parent_typ Type, concrete_types []Type) int {
+	parent_sym := t.sym(parent_typ)
+	if parent_sym.info !is Struct {
+		return 0
+	}
+	struct_info := parent_sym.info as Struct
+	if struct_info.generic_types.len == 0 || concrete_types.len != struct_info.generic_types.len {
+		return 0
+	}
+	mut inst_name := parent_sym.ngname + '['
+	mut inst_cname := parent_sym.cname + '_T_'
+	for i, ct in concrete_types {
+		ct_sym := t.sym(ct)
+		inst_name += ct_sym.name
+		inst_cname += ct_sym.cname
+		if i < concrete_types.len - 1 {
+			inst_name += ', '
+			inst_cname += '_T_'
+		}
+	}
+	inst_name += ']'
+	existing_idx := t.type_idxs[inst_name]
+	if existing_idx > 0 {
+		return existing_idx
+	}
+	return t.register_sym(
+		kind:   .generic_inst
+		name:   inst_name
+		cname:  inst_cname
+		ngname: parent_sym.ngname
+		mod:    parent_sym.mod
+		info:   GenericInst{
+			parent_idx:     parent_typ.idx()
+			concrete_types: concrete_types
 		}
 	)
 }
@@ -1366,16 +1425,17 @@ pub fn (mut t Table) add_placeholder_type(name string, cname string, language La
 	if name.contains('.') {
 		modname = name.all_before_last('.')
 	}
-	ph_type := TypeSymbol{
+	placeholder_sym := TypeSymbol{
 		kind:       .placeholder
 		name:       name
 		cname:      util.no_dots(cname).replace_each(['&', ''])
+		ngname:     strip_generic_params(name)
 		language:   language
 		mod:        modname
 		is_pub:     true
 		is_builtin: name in builtins
 	}
-	return t.register_sym(ph_type)
+	return t.register_sym(placeholder_sym)
 }
 
 @[inline]
@@ -1871,6 +1931,11 @@ pub fn (mut t Table) convert_generic_type(generic_type Type, generic_names []str
 				type_changed = true
 			}
 			if type_changed {
+				// map[Type]T where T is an alias to map type
+				if to_types.len == 1 && sym.info.value_type.has_flag(.generic)
+					&& t.type_kind(to_types[0]) == .alias && t.final_sym(to_types[0]).kind == .map {
+					return unwrapped_value_type
+				}
 				idx := t.find_or_register_map(unwrapped_key_type, unwrapped_value_type)
 				if unwrapped_key_type.has_flag(.generic) || unwrapped_value_type.has_flag(.generic) {
 					return new_type(idx).derive_add_muls(generic_type).set_flag(.generic)
@@ -1883,7 +1948,7 @@ pub fn (mut t Table) convert_generic_type(generic_type Type, generic_names []str
 			if sym.info.is_generic {
 				mut nrt := '${sym.name}['
 				mut rnrt := '${sym.rname}['
-				mut cnrt := '${sym.cname}['
+				mut cnrt := '${sym.cname}_T_'
 				mut t_generic_names := generic_names.clone()
 				mut t_to_types := to_types.clone()
 				if sym.generic_types.len > 0 && sym.generic_types.len == sym.info.generic_types.len
@@ -1920,7 +1985,7 @@ pub fn (mut t Table) convert_generic_type(generic_type Type, generic_names []str
 						if i != sym.info.generic_types.len - 1 {
 							nrt += ', '
 							rnrt += ', '
-							cnrt += ', '
+							cnrt += '_'
 						}
 					} else {
 						return none
@@ -1928,7 +1993,6 @@ pub fn (mut t Table) convert_generic_type(generic_type Type, generic_names []str
 				}
 				nrt += ']'
 				rnrt += ']'
-				cnrt += ']'
 				mut idx := t.type_idxs[nrt]
 				if idx == 0 {
 					idx = t.type_idxs[rnrt]
@@ -2767,4 +2831,9 @@ pub fn (mut t Table) get_veb_result_type_idx() int {
 
 	t.veb_res_idx_cache = t.find_type('veb.Result')
 	return t.veb_res_idx_cache
+}
+
+@[inline]
+pub fn (mut t Table) register_vls_info(key string, val VlsInfo) {
+	t.vls_info[key] = val
 }

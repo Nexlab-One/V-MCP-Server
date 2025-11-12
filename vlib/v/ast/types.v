@@ -115,6 +115,7 @@ pub mut:
 	name          string // the internal & source name of the type, i.e. `[5]int`.
 	cname         string // the name with no dots for use in the generated C code
 	rname         string // the raw name
+	ngname        string // the name without generic parameters
 	methods       []Fn
 	generic_types []Type
 	mod           string
@@ -188,6 +189,7 @@ pub mut:
 	generic_types  []Type
 	concrete_types []Type
 	parent_type    Type
+	name_pos       token.Pos
 }
 
 // instantiation of a generic struct
@@ -212,6 +214,7 @@ pub mut:
 	generic_types  []Type
 	concrete_types []Type
 	parent_type    Type
+	name_pos       token.Pos
 }
 
 pub struct Enum {
@@ -222,6 +225,7 @@ pub:
 	uses_exprs       bool
 	typ              Type
 	attrs            map[string][]Attr
+	name_pos         token.Pos
 }
 
 @[minify]
@@ -231,6 +235,7 @@ pub mut:
 pub:
 	language  Language
 	is_import bool
+	name_pos  token.Pos
 }
 
 pub struct Aggregate {
@@ -273,6 +278,7 @@ pub struct Map {
 pub mut:
 	key_type   Type
 	value_type Type
+	name_pos   token.Pos
 }
 
 @[minify]
@@ -287,6 +293,7 @@ pub mut:
 	generic_types  []Type
 	concrete_types []Type
 	parent_type    Type
+	name_pos       token.Pos
 }
 
 // <atomic.h> defines special typenames

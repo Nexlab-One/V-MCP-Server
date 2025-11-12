@@ -7,11 +7,13 @@ import strings
 import v.ast
 import v.util
 
-const c_fn_name_escape_seq = ['[', '_T_', ']', '']
+// has[int]() => has_T_int()
+// has[int, string]() => has_T_int_string()
+const c_fn_name_escape_seq = ['[', '_T_', ', ', '_', ']', '']
 
 fn (mut g Gen) is_used_by_main(node ast.FnDecl) bool {
 	$if trace_unused_by_main ? {
-		defer {
+		defer(fn) {
 			used_by_main := $res()
 			if !used_by_main {
 				fkey := node.fkey()
@@ -181,12 +183,12 @@ fn (mut g Gen) gen_fn_decl(node &ast.FnDecl, skip bool) {
 	}
 
 	tmp_defer_vars := g.defer_vars // must be here because of workflow
-	if !g.anon_fn {
+	if g.anon_fn == unsafe { nil } {
 		g.defer_vars = []string{}
 	} else {
 		if node.defer_stmts.len > 0 {
 			g.defer_vars = []string{}
-			defer {
+			defer(fn) {
 				g.defer_vars = tmp_defer_vars
 			}
 		}
@@ -421,6 +423,9 @@ fn (mut g Gen) gen_fn_decl(node &ast.FnDecl, skip bool) {
 		node.is_c_variadic)
 	if is_closure {
 		g.nr_closures++
+		if g.pref.no_closures {
+			g.error('a closure was generated for function', node.pos)
+		}
 	}
 	arg_str := g.out.after(arg_start_pos)
 	if node.no_body || ((g.pref.use_cache && g.pref.build_mode != .build_module) && node.is_builtin
@@ -451,6 +456,9 @@ fn (mut g Gen) gen_fn_decl(node &ast.FnDecl, skip bool) {
 	}
 	g.indent++
 	for defer_stmt in node.defer_stmts {
+		if defer_stmt.mode != .function {
+			continue
+		}
 		g.writeln('bool ${g.defer_flag_var(defer_stmt)} = false;')
 		for var in defer_stmt.defer_vars {
 			if var.name in fargs || var.kind == .constant {
@@ -531,7 +539,7 @@ fn (mut g Gen) gen_fn_decl(node &ast.FnDecl, skip bool) {
 	// clear g.fn_mut_arg_names
 
 	if !node.has_return {
-		g.write_defer_stmts_when_needed()
+		g.write_defer_stmts_when_needed(node.scope, false, node.name_pos)
 	}
 	if node.is_anon {
 		g.defer_stmts = prev_defer_stmts
@@ -582,8 +590,7 @@ fn (mut g Gen) c_fn_name(node &ast.FnDecl) string {
 			name = name.replace_each(c_fn_name_escape_seq)
 		}
 	}
-	if node.is_anon && g.comptime.comptime_for_method_var != ''
-		&& node.scope.is_inherited_var('method') {
+	if node.is_anon && g.anon_fn.has_ct_var {
 		name = '${name}_${g.comptime.comptime_loop_id}'
 	}
 	if node.language == .c {
@@ -621,8 +628,7 @@ fn (mut g Gen) gen_closure_fn_name(node ast.AnonFn) string {
 	if node.decl.generic_names.len > 0 {
 		fn_name = g.generic_fn_name(g.cur_concrete_types, fn_name)
 	}
-	if node.inherited_vars.len > 0 && g.comptime.comptime_for_method_var != ''
-		&& node.inherited_vars.any(it.name == 'method') {
+	if node.has_ct_var {
 		fn_name += '_${g.comptime.comptime_loop_id}'
 	}
 	return fn_name
@@ -742,7 +748,7 @@ fn (mut g Gen) gen_anon_fn_decl(mut node ast.AnonFn) {
 	}
 	pos := g.out.len
 	was_anon_fn := g.anon_fn
-	g.anon_fn = true
+	g.anon_fn = node
 	g.fn_decl(node.decl)
 	g.anon_fn = was_anon_fn
 	builder.write_string(g.out.cut_to(pos))
@@ -750,22 +756,6 @@ fn (mut g Gen) gen_anon_fn_decl(mut node ast.AnonFn) {
 	g.anon_fn_definitions << out
 	if g.pref.parallel_cc {
 		g.extern_out.writeln('extern ${out.all_before(' {')};')
-	}
-}
-
-fn (g &Gen) defer_flag_var(stmt &ast.DeferStmt) string {
-	return '${g.last_fn_c_name}_defer_${stmt.idx_in_fn}'
-}
-
-fn (mut g Gen) write_defer_stmts_when_needed() {
-	// unlock all mutexes, in case we are in a lock statement. defers are not allowed in lock statements
-	g.unlock_locks()
-	if g.defer_stmts.len > 0 {
-		g.write_defer_stmts()
-	}
-	if g.defer_profile_code.len > 0 {
-		g.writeln2('', '\t// defer_profile_code')
-		g.writeln2(g.defer_profile_code, '')
 	}
 }
 
@@ -1033,8 +1023,8 @@ fn (mut g Gen) call_expr(node ast.CallExpr) {
 			g.indent++
 			g.write('${tmp_opt} = ')
 		} else if !g.inside_curry_call {
-			if g.assign_ct_type != 0 && node.or_block.kind in [.propagate_option, .propagate_result] {
-				styp = g.styp(g.assign_ct_type.derive(ret_typ))
+			if g.assign_ct_type[node.pos.pos] != 0 && node.or_block.kind != .absent {
+				styp = g.styp(g.assign_ct_type[node.pos.pos].derive(ret_typ))
 			}
 			g.write('${styp} ${tmp_opt} = ')
 			if node.left is ast.AnonFn {
@@ -1076,9 +1066,8 @@ fn (mut g Gen) call_expr(node ast.CallExpr) {
 			g.write('\n ${cur_line}')
 		} else if !g.inside_curry_call {
 			if !g.inside_const_opt_or_res {
-				if g.assign_ct_type != 0
-					&& node.or_block.kind in [.propagate_option, .propagate_result] {
-					unwrapped_styp = g.styp(g.assign_ct_type.derive(node.return_type).clear_option_and_result())
+				if g.assign_ct_type[node.pos.pos] != 0 && node.or_block.kind != .absent {
+					unwrapped_styp = g.styp(g.assign_ct_type[node.pos.pos].derive(node.return_type).clear_option_and_result())
 				}
 				if g.table.sym(node.return_type).kind == .array_fixed
 					&& unwrapped_styp.starts_with('_v_') {
@@ -1305,6 +1294,9 @@ fn (mut g Gen) gen_array_method_call(node ast.CallExpr, left_type ast.Type, left
 
 fn (mut g Gen) gen_fixed_array_method_call(node ast.CallExpr, left_type ast.Type) bool {
 	match node.name {
+		'filter' {
+			g.gen_array_filter(node)
+		}
 		'index' {
 			g.gen_array_index(node)
 		}
@@ -2077,7 +2069,7 @@ fn (mut g Gen) fn_call(node ast.CallExpr) {
 	if is_print && (node.args[0].typ != ast.string_type
 		|| g.comptime.comptime_for_method != unsafe { nil } || node.args[0].ct_expr) {
 		g.inside_interface_deref = true
-		defer {
+		defer(fn) {
 			g.inside_interface_deref = false
 		}
 		mut typ := g.type_resolver.get_type_or_default(node.args[0].expr, node.args[0].typ)
@@ -2143,7 +2135,7 @@ fn (mut g Gen) fn_call(node ast.CallExpr) {
 	if !print_auto_str {
 		if is_print {
 			g.inside_interface_deref = true
-			defer {
+			defer(fn) {
 				g.inside_interface_deref = false
 			}
 		}
@@ -2321,7 +2313,7 @@ fn (mut g Gen) autofree_call_pregen(node ast.CallExpr) {
 		if !arg.is_tmp_autofree {
 			if arg.expr is ast.CallExpr && arg.expr.name in ['json.encode', 'json.encode_pretty'] {
 				t := '_arg_expr_${arg.expr.name.replace('.', '_')}_${arg.expr.pos.pos}'
-				defer {
+				defer(fn) {
 					g.writeln(';\n\tbuiltin__string_free(&${t});')
 				}
 			}
@@ -2416,6 +2408,40 @@ fn (mut g Gen) call_args(node ast.CallExpr) {
 						{
 							expected_types[i] = utyp
 						}
+					}
+				}
+			}
+		}
+	}
+	if node.is_method {
+		left_sym := g.table.sym(node.left_type)
+		if left_sym.info is ast.Struct && left_sym.info.generic_types.len > 0
+			&& left_sym.info.concrete_types.len > 0 {
+			base_type_idx := g.table.find_type_idx(left_sym.name.all_before('['))
+			mut func := ast.Fn{}
+			mut found := false
+			for {
+				if base_type_idx > 0 {
+					base_sym := g.table.sym(ast.idx_to_type(base_type_idx))
+					if base_func := g.table.find_method(base_sym, node.name) {
+						func = base_func
+						found = true
+						break
+					}
+				}
+				if base_func := g.table.find_method(left_sym, node.name) {
+					func = base_func
+					found = true
+				}
+				break
+			}
+			if found && func.generic_names.len > 0 {
+				for i in 0 .. expected_types.len {
+					mut muttable := unsafe { &ast.Table(g.table) }
+					if utyp := muttable.convert_generic_type(node.expected_arg_types[i],
+						func.generic_names, left_sym.info.concrete_types)
+					{
+						expected_types[i] = utyp
 					}
 				}
 			}

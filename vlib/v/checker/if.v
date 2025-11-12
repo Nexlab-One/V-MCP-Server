@@ -77,7 +77,7 @@ fn (mut c Checker) if_expr(mut node ast.IfExpr) ast.Type {
 	former_expected_type := c.expected_type
 	if node_is_expr {
 		c.expected_expr_type = c.expected_type
-		defer {
+		defer(fn) {
 			c.expected_expr_type = ast.void_type
 		}
 	}
@@ -137,7 +137,7 @@ fn (mut c Checker) if_expr(mut node ast.IfExpr) ast.Type {
 				}
 				if old_val := c.table.comptime_is_true[idx_str] {
 					if old_val.val != comptime_if_result {
-						c.error('checker erro1r : branch eval wrong', branch.cond.pos())
+						c.error('checker error : branch eval wrong', branch.cond.pos())
 					}
 				}
 
@@ -155,6 +155,17 @@ fn (mut c Checker) if_expr(mut node ast.IfExpr) ast.Type {
 					//&& cond_typ.idx() != ast.void_type_idx { TODO bring back after the void split
 					c.error('non-bool type `${c.table.type_to_str(cond_typ)}` used as if condition',
 						branch.cond.pos())
+				}
+				if !c.pref.translated && !c.file.is_translated {
+					mut check_expr := branch.cond
+					t_expr := c.checker_transformer.expr(mut check_expr)
+					if t_expr is ast.BoolLiteral {
+						if t_expr.val {
+							c.note('condition is always true', branch.cond.pos())
+						} else {
+							c.note('condition is always false', branch.cond.pos())
+						}
+					}
 				}
 			}
 		} else {
@@ -201,6 +212,11 @@ fn (mut c Checker) if_expr(mut node ast.IfExpr) ast.Type {
 					}
 				}
 			} else {
+				if branch.cond.vars.len != 1 {
+					c.error('if guard expects a single variable, but got ${branch.cond.vars.len}',
+						branch.pos)
+					continue
+				}
 				for _, var in branch.cond.vars {
 					if var.name == '_' {
 						continue
@@ -303,7 +319,9 @@ fn (mut c Checker) if_expr(mut node ast.IfExpr) ast.Type {
 							node.is_expr = true
 							node.typ = c.unwrap_generic(c.expected_type)
 						}
-						continue
+						unsafe {
+							goto end_if
+						}
 					}
 					if c.expected_expr_type != ast.void_type {
 						c.expected_type = c.expected_expr_type
@@ -322,7 +340,9 @@ fn (mut c Checker) if_expr(mut node ast.IfExpr) ast.Type {
 						// (e.g. argument expression, variable declaration / assignment)
 						c.error('the final expression in `if` or `match`, must have a value of a non-void type',
 							stmt.pos)
-						continue
+						unsafe {
+							goto end_if
+						}
 					}
 					if !c.check_types(stmt.typ, node.typ) {
 						if node.typ == ast.void_type {
@@ -334,37 +354,51 @@ fn (mut c Checker) if_expr(mut node ast.IfExpr) ast.Type {
 								node.typ = stmt.typ
 							}
 							c.expected_expr_type = node.typ
-							continue
+							unsafe {
+								goto end_if
+							}
 						} else if node.typ in [ast.float_literal_type, ast.int_literal_type] {
 							if node.typ == ast.int_literal_type {
 								if stmt.typ.is_int() || stmt.typ.is_float() {
 									node.typ = stmt.typ
-									continue
+									unsafe {
+										goto end_if
+									}
 								}
 							} else { // node.typ == float_literal
 								if stmt.typ.is_float() {
 									node.typ = stmt.typ
-									continue
+									unsafe {
+										goto end_if
+									}
 								}
 							}
 						}
 						if stmt.typ in [ast.float_literal_type, ast.int_literal_type] {
 							if stmt.typ == ast.int_literal_type {
 								if node.typ.is_int() || node.typ.is_float() {
-									continue
+									unsafe {
+										goto end_if
+									}
 								}
 							} else { // expr_type == float_literal
 								if node.typ.is_float() {
-									continue
+									unsafe {
+										goto end_if
+									}
 								}
 							}
 						}
 						if node.is_expr && c.table.sym(former_expected_type).kind == .sum_type {
 							node.typ = former_expected_type
-							continue
+							unsafe {
+								goto end_if
+							}
 						}
 						if is_noreturn_callexpr(stmt.expr) {
-							continue
+							unsafe {
+								goto end_if
+							}
 						}
 						if (node.typ.has_option_or_result())
 							&& c.table.sym(stmt.typ).kind == .struct
@@ -377,7 +411,9 @@ fn (mut c Checker) if_expr(mut node ast.IfExpr) ast.Type {
 								pos:       node.pos
 							}
 							stmt.typ = ast.error_type
-							continue
+							unsafe {
+								goto end_if
+							}
 						}
 						if (node.typ == ast.none_type && stmt.typ != ast.none_type)
 							|| (stmt.typ == ast.none_type && node.typ != ast.none_type) {
@@ -386,11 +422,19 @@ fn (mut c Checker) if_expr(mut node ast.IfExpr) ast.Type {
 							} else {
 								node.typ.set_flag(.option)
 							}
-							continue
+							unsafe {
+								goto end_if
+							}
 						}
 						c.error('mismatched types `${c.table.type_to_str(node.typ)}` and `${c.table.type_to_str(stmt.typ)}`',
 							node.pos)
 					} else {
+						if !node.typ.has_option_or_result() && !node.typ.has_flag(.shared_f)
+							&& stmt.typ != ast.voidptr_type
+							&& stmt.typ.nr_muls() != node.typ.nr_muls() {
+							c.error('mismatched types `${c.table.type_to_str(node.typ)}` and `${c.table.type_to_str(stmt.typ)}`',
+								node.pos)
+						}
 						if node.is_expr == false && c.type_resolver.is_generic_param_var(stmt.expr) {
 							// generic variable no yet type bounded
 							node.is_expr = true
@@ -429,7 +473,7 @@ fn (mut c Checker) if_expr(mut node ast.IfExpr) ast.Type {
 				nbranches_without_return++
 			}
 		}
-
+		end_if:
 		if comptime_remove_curr_branch_stmts && !c.pref.output_cross_c {
 			// remove the branch statements since they may contain OS-specific code.
 			branch.stmts = []

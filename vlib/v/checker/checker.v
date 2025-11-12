@@ -33,7 +33,8 @@ pub const array_builtin_methods = ['filter', 'clone', 'repeat', 'reverse', 'map'
 	'first', 'last', 'pop_left', 'pop', 'delete', 'insert', 'prepend', 'count']
 pub const array_builtin_methods_chk = token.new_keywords_matcher_from_array_trie(array_builtin_methods)
 pub const fixed_array_builtin_methods = ['contains', 'index', 'any', 'all', 'wait', 'map', 'sort',
-	'sorted', 'sort_with_compare', 'sorted_with_compare', 'reverse', 'reverse_in_place', 'count']
+	'sorted', 'sort_with_compare', 'sorted_with_compare', 'reverse', 'reverse_in_place', 'count',
+	'filter']
 pub const fixed_array_builtin_methods_chk = token.new_keywords_matcher_from_array_trie(fixed_array_builtin_methods)
 // TODO: remove `byte` from this list when it is no longer supported
 pub const reserved_type_names = ['bool', 'char', 'i8', 'i16', 'i32', 'int', 'i64', 'u8', 'u16',
@@ -151,7 +152,8 @@ mut:
 	v_current_commit_hash string // same as old C.V_CURRENT_COMMIT_HASH
 	assign_stmt_attr      string // for `x := [1,2,3] @[freed]`
 
-	js_string ast.Type = ast.void_type // when `js"string literal"` is used, `js_string` will be equal to `JS.String`
+	js_string           ast.Type                 = ast.void_type // when `js"string literal"` is used, `js_string` will be equal to `JS.String`
+	checker_transformer &transformer.Transformer = unsafe { nil }
 }
 
 pub fn new_checker(table &ast.Table, pref_ &pref.Preferences) &Checker {
@@ -173,6 +175,7 @@ pub fn new_checker(table &ast.Table, pref_ &pref.Preferences) &Checker {
 		)
 		match_exhaustive_cutoff_limit: pref_.checker_match_exhaustive_cutoff_limit
 		v_current_commit_hash:         v_current_commit_hash
+		checker_transformer:           transformer.new_transformer_with_table(table, pref_)
 	}
 	checker.type_resolver = type_resolver.TypeResolver.new(table, checker)
 	checker.comptime = &checker.type_resolver.info
@@ -353,6 +356,10 @@ pub fn (mut c Checker) check_files(ast_files []&ast.File) {
 		mut files_from_main_module := []&ast.File{}
 		for i in 0 .. ast_files.len {
 			mut file := ast_files[i]
+			if c.pref.is_vls && file.path != c.pref.path {
+				// in `vls` mode, only check the user file
+				continue
+			}
 			c.timers.start('checker_check ${file.path}')
 			c.check(mut file)
 			if file.mod.name == 'no_main' {
@@ -386,7 +393,11 @@ pub fn (mut c Checker) check_files(ast_files []&ast.File) {
 		}
 	}
 	c.timers.start('checker_post_process_generic_fns')
-	last_file := c.file
+	mut last_file := c.file
+	// c.file might be nil in vls mode, fall back to first file
+	if c.pref.is_vls && last_file == unsafe { nil } && ast_files.len > 0 {
+		last_file = ast_files[0]
+	}
 	// post process generic functions. must be done after all files have been
 	// checked, to ensure all generic calls are processed, as this information
 	// is needed when the generic type is auto inferred from the call argument.
@@ -436,40 +447,6 @@ pub fn (mut c Checker) check_files(ast_files []&ast.File) {
 			c.add_error_detail('fn test_xyz(){ assert 2 + 2 == 4 }')
 			c.error('a _test.v file should have *at least* one `test_` function', token.Pos{})
 		}
-	}
-	// After the main checker run, run the line info check, print line info, and exit (if it's present)
-	if !c.pref.linfo.is_running && c.pref.line_info != '' { //'' && c.pref.linfo.line_nr == 0 {
-		// c.do_line_info(c.pref.line_info, ast_files)
-		// println('setting is_running=true,  pref.path=${c.pref.linfo.path} curdir' + os.getwd())
-		c.pref.linfo.is_running = true
-		// println('linfo path=${c.pref.linfo.path}')
-		// Go to definition
-		if c.pref.linfo.expr.starts_with('gd^') {
-			c.ident_gotodef()
-			exit(0)
-		}
-		if c.pref.linfo.expr.contains('()') {
-			c.autocomplete_for_fn_call_expr()
-			exit(0)
-		}
-		for i, file in ast_files {
-			// println(file.path)
-			if file.path == c.pref.linfo.path {
-				// println('running c.check_files')
-				c.check_files([ast_files[i]])
-				exit(0)
-			} else if file.path.starts_with('./') {
-				// Maybe it's a "./foo.v", linfo.path has an absolute path
-				abs_path := os.join_path(os.getwd(), file.path).replace('/./', '/') // TODO: join_path shouldn't have /./
-				if abs_path == c.pref.linfo.path {
-					c.check_files([ast_files[i]])
-					c.run_ac(ast_files[i])
-					exit(0)
-				}
-			}
-		}
-		println('failed to find file "${c.pref.linfo.path}"')
-		exit(0)
 	}
 	// Make sure fn main is defined in non lib builds
 	if c.pref.build_mode == .build_module || c.pref.is_test {
@@ -970,7 +947,7 @@ fn (mut c Checker) fail_if_immutable(mut expr ast.Expr) (string, token.Pos) {
 					}
 				}
 			} else if expr.obj is ast.ConstField && expr.name in c.const_names {
-				if !c.pref.translated {
+				if !c.pref.translated && c.mod != 'veb' {
 					// TODO: fix this in c2v, do not allow modification of all consts
 					// in translated code
 					c.error('cannot modify constant `${expr.name}`', expr.pos)
@@ -2134,8 +2111,7 @@ fn (mut c Checker) enum_decl(mut node ast.EnumDecl) {
 				ast.InfixExpr {
 					// Handle `enum Foo { x = 1 + 2 }`
 					c.infix_expr(mut field.expr)
-					mut t := transformer.new_transformer_with_table(c.table, c.pref)
-					folded_expr := t.infix_expr(mut field.expr)
+					folded_expr := c.checker_transformer.infix_expr(mut field.expr)
 
 					if folded_expr is ast.IntegerLiteral {
 						c.check_enum_field_integer_literal(folded_expr, signed, node.is_multi_allowed,
@@ -2145,8 +2121,7 @@ fn (mut c Checker) enum_decl(mut node ast.EnumDecl) {
 				}
 				ast.ParExpr {
 					c.expr(mut field.expr.expr)
-					mut t := transformer.new_transformer_with_table(c.table, c.pref)
-					folded_expr := t.expr(mut field.expr.expr)
+					folded_expr := c.checker_transformer.expr(mut field.expr.expr)
 
 					if folded_expr is ast.IntegerLiteral {
 						c.check_enum_field_integer_literal(folded_expr, signed, node.is_multi_allowed,
@@ -2185,9 +2160,7 @@ fn (mut c Checker) enum_decl(mut node ast.EnumDecl) {
 						if field.expr.kind == .constant && field.expr.obj.typ.is_int() {
 							// accepts int constants as enum value
 							if mut field.expr.obj is ast.ConstField {
-								mut t := transformer.new_transformer_with_table(c.table,
-									c.pref)
-								folded_expr := t.expr(mut field.expr.obj.expr)
+								folded_expr := c.checker_transformer.expr(mut field.expr.obj.expr)
 
 								if folded_expr is ast.IntegerLiteral {
 									c.check_enum_field_integer_literal(folded_expr, signed,
@@ -2339,6 +2312,14 @@ fn (mut c Checker) stmt(mut node ast.Stmt) {
 							c.error('unused expression', node.pos)
 						}
 					}
+					if node.expr.op == .arrow {
+						if mut node.expr.right is ast.CallExpr {
+							if node.expr.right.return_type.has_flag(.result) {
+								node.expr.or_block.err_used = node.expr.or_block.scope.known_var('err')
+								node.expr.right.or_block = node.expr.or_block
+							}
+						}
+					}
 				}
 			}
 			if !c.inside_return {
@@ -2365,35 +2346,7 @@ fn (mut c Checker) stmt(mut node ast.Stmt) {
 			c.inside_const = false
 		}
 		ast.DeferStmt {
-			c.inside_defer = true
-			if node.idx_in_fn < 0 && c.table.cur_fn != unsafe { nil } {
-				node.idx_in_fn = c.table.cur_fn.defer_stmts.len
-				c.table.cur_fn.defer_stmts << unsafe { &node }
-			}
-			if c.locked_names.len != 0 || c.rlocked_names.len != 0 {
-				c.error('defers are not allowed in lock statements', node.pos)
-			}
-			for i, ident in node.defer_vars {
-				mut id := ident
-				if mut id.info is ast.IdentVar {
-					if id.comptime && (id.tok_kind == .question
-						|| id.name in ast.valid_comptime_not_user_defined) {
-						node.defer_vars[i] = ast.Ident{
-							scope: unsafe { nil }
-							name:  ''
-						}
-						continue
-					}
-					typ := c.ident(mut id)
-					if typ == ast.error_type_idx {
-						continue
-					}
-					id.info.typ = typ
-					node.defer_vars[i] = id
-				}
-			}
-			c.stmts(mut node.stmts)
-			c.inside_defer = false
+			c.defer_stmt(mut node)
 		}
 		ast.EnumDecl {
 			c.enum_decl(mut node)
@@ -2464,6 +2417,44 @@ fn (mut c Checker) stmt(mut node ast.Stmt) {
 			c.assert_stmt(mut node)
 		}
 	}
+}
+
+fn (mut c Checker) defer_stmt(mut node ast.DeferStmt) {
+	c.inside_defer = true
+	if node.idx_in_fn < 0 && c.table.cur_fn != unsafe { nil } {
+		node.idx_in_fn = c.table.cur_fn.defer_stmts.len
+		c.table.cur_fn.defer_stmts << unsafe { &node }
+	}
+	if node.mode == .function {
+		if !isnil(c.fn_scope) && node.scope == c.fn_scope {
+			c.warn('`defer` is already in function scope; just use `defer {` instead',
+				node.pos)
+		}
+		if c.locked_names.len != 0 || c.rlocked_names.len != 0 {
+			c.error('`defer(fn)`s are not allowed in lock statements', node.pos)
+		}
+		for i, ident in node.defer_vars {
+			mut id := ident
+			if mut id.info is ast.IdentVar {
+				if id.comptime
+					&& (id.tok_kind == .question || id.name in ast.valid_comptime_not_user_defined) {
+					node.defer_vars[i] = ast.Ident{
+						scope: unsafe { nil }
+						name:  ''
+					}
+					continue
+				}
+				typ := c.ident(mut id)
+				if typ == ast.error_type_idx {
+					continue
+				}
+				id.info.typ = typ
+				node.defer_vars[i] = id
+			}
+		}
+	}
+	c.stmts(mut node.stmts)
+	c.inside_defer = false
 }
 
 fn (mut c Checker) assert_stmt(mut node ast.AssertStmt) {
@@ -2949,7 +2940,11 @@ fn (mut c Checker) stmts_ending_with_expression(mut stmts []ast.Stmt, expected_o
 			unreachable = stmt.pos
 		}
 		prev_expected_or_type := c.expected_or_type
-		c.expected_or_type = expected_or_type
+		c.expected_or_type = if c.is_last_stmt {
+			expected_or_type
+		} else {
+			ast.void_type
+		}
 		c.stmt(mut stmt)
 		c.expected_or_type = prev_expected_or_type
 		if !c.inside_anon_fn && c.in_for_count > 0 && stmt is ast.BranchStmt
@@ -3008,6 +3003,11 @@ pub fn (mut c Checker) expr(mut node ast.Expr) ast.Type {
 	if c.expr_level > expr_level_cutoff_limit {
 		c.error('checker: too many expr levels: ${c.expr_level} ', node.pos())
 		return ast.void_type
+	}
+	defer {
+		if c.pref.is_vls {
+			c.ident_gotodef(node)
+		}
 	}
 	match mut node {
 		ast.IfExpr {
@@ -3249,7 +3249,7 @@ pub fn (mut c Checker) expr(mut node ast.Expr) ast.Type {
 		ast.LambdaExpr {
 			c.inside_lambda = true
 			c.table.cur_lambda = unsafe { &node }
-			defer {
+			defer(fn) {
 				c.inside_lambda = false
 				c.table.cur_lambda = unsafe { nil }
 			}
@@ -3527,9 +3527,15 @@ fn (mut c Checker) cast_expr(mut node ast.CastExpr) ast.Type {
 			from_type = node.expr_type
 		}
 		if !c.table.sumtype_has_variant(to_type, from_type, false) {
-			ft := c.table.type_to_str(from_type)
 			tt := c.table.type_to_str(to_type)
-			c.error('cannot cast `${ft}` to `${tt}`', node.pos)
+			if from_type == ast.voidptr_type_idx && to_type.is_ptr() {
+				if !c.inside_unsafe {
+					c.error('cannot cast voidptr to `${tt}` outside `unsafe`', node.pos)
+				}
+			} else {
+				ft := c.table.type_to_str(from_type)
+				c.error('cannot cast `${ft}` to `${tt}`', node.pos)
+			}
 		}
 	} else if mut to_sym.info is ast.Alias && !(final_to_sym.kind == .struct && final_to_is_ptr) {
 		if (!c.check_types(from_type, to_sym.info.parent_type) && !(final_to_sym.is_int()
@@ -3550,7 +3556,8 @@ fn (mut c Checker) cast_expr(mut node ast.CastExpr) ast.Type {
 				c.warn('casting to struct is deprecated, use e.g. `Struct{...expr}` instead',
 					node.pos)
 			}
-			if !c.check_struct_signature(from_sym.info, to_sym.info) {
+			if from_type.idx() != to_type.idx()
+				&& !c.check_struct_signature(from_sym.info, to_sym.info) {
 				c.error('cannot convert struct `${from_sym.name}` to struct `${to_sym.name}`',
 					node.pos)
 			}
@@ -4135,10 +4142,10 @@ fn (mut c Checker) resolve_var_fn(func &ast.Fn, mut node ast.Ident, name string)
 }
 
 fn (mut c Checker) ident(mut node ast.Ident) ast.Type {
-	if c.pref.linfo.is_running {
-		// LS hack (v -line-info "a.v:16")
-		// TODO perf $if
-		c.ident_autocomplete(node)
+	defer {
+		if c.pref.is_vls {
+			c.ident_autocomplete(node)
+		}
 	}
 	// TODO: move this
 	if c.const_deps.len > 0 {
@@ -5567,7 +5574,7 @@ fn (mut c Checker) ensure_generic_type_specify_type_names(typ ast.Type, pos toke
 fn (mut c Checker) ensure_type_exists(typ ast.Type, pos token.Pos) bool {
 	if typ == 0 {
 		c.error('unknown type', pos)
-		return false
+		return c.pref.is_vls
 	}
 	c.type_level++
 	defer {
@@ -5576,7 +5583,7 @@ fn (mut c Checker) ensure_type_exists(typ ast.Type, pos token.Pos) bool {
 	if c.type_level > type_level_cutoff_limit {
 		c.error('checker: too many levels of Checker.ensure_type_exists calls: ${c.type_level}, probably due to a self referencing type',
 			pos)
-		return false
+		return c.pref.is_vls
 	}
 	sym := c.table.sym(typ)
 	if !c.is_builtin_mod && !sym.is_pub && sym.mod != c.mod && sym.mod != 'main' {
@@ -5593,12 +5600,12 @@ fn (mut c Checker) ensure_type_exists(typ ast.Type, pos token.Pos) bool {
 			if fn_mod != '' && fn_mod != c.mod && fn_info.func.name != '' && !fn_info.is_anon {
 				c.error('function type `${fn_info.func.name}` was declared as private to module `${fn_mod}`, so it can not be used inside module `${c.mod}`',
 					pos)
-				return false
+				return c.pref.is_vls
 			}
 		} else if sym.mod != '' {
 			c.error('${sym.kind} `${sym.name}` was declared as private to module `${sym.mod}`, so it can not be used inside module `${c.mod}`',
 				pos)
-			return false
+			return c.pref.is_vls
 		}
 	}
 	match sym.kind {
@@ -5612,7 +5619,7 @@ fn (mut c Checker) ensure_type_exists(typ ast.Type, pos token.Pos) bool {
 			if sym.language == .v {
 				c.error(util.new_suggestion(sym.name, c.table.known_type_names()).say('unknown type `${sym.name}`'),
 					pos)
-				return false
+				return c.pref.is_vls
 			} else if sym.language == .c {
 				if !c.pref.translated && !c.file.is_translated {
 					c.warn(util.new_suggestion(sym.name, c.table.known_type_names()).say('unknown type `${sym.name}` (all virtual C types must be defined, this will be an error soon)'),
@@ -5634,44 +5641,44 @@ fn (mut c Checker) ensure_type_exists(typ ast.Type, pos token.Pos) bool {
 					'unknown type `${sym.name}`.\nDid you mean `f64`?'
 				}
 				c.error(msg, pos)
-				return false
+				return c.pref.is_vls
 			}
 		}
 		.function {
 			fn_info := sym.info as ast.FnType
 			if !c.ensure_type_exists(fn_info.func.return_type, fn_info.func.return_type_pos) {
-				return false
+				return c.pref.is_vls
 			}
 			for param in fn_info.func.params {
 				if !c.ensure_type_exists(param.typ, param.type_pos) {
-					return false
+					return c.pref.is_vls
 				}
 			}
 		}
 		.array {
 			if !c.ensure_type_exists((sym.info as ast.Array).elem_type, pos) {
-				return false
+				return c.pref.is_vls
 			}
 		}
 		.array_fixed {
 			if !c.ensure_type_exists((sym.info as ast.ArrayFixed).elem_type, pos) {
-				return false
+				return c.pref.is_vls
 			}
 		}
 		.map {
 			info := sym.info as ast.Map
 			if !c.ensure_type_exists(info.key_type, pos) {
-				return false
+				return c.pref.is_vls
 			}
 			if !c.ensure_type_exists(info.value_type, pos) {
-				return false
+				return c.pref.is_vls
 			}
 		}
 		.sum_type {
 			info := sym.info as ast.SumType
 			for concrete_typ in info.concrete_types {
 				if !c.ensure_type_exists(concrete_typ, pos) {
-					return false
+					return c.pref.is_vls
 				}
 			}
 		}
@@ -5681,7 +5688,7 @@ fn (mut c Checker) ensure_type_exists(typ ast.Type, pos token.Pos) bool {
 					...pos
 					col: pos.col + 5
 				}) {
-					return false
+					return c.pref.is_vls
 				}
 			}
 		}

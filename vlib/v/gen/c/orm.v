@@ -53,16 +53,24 @@ fn (mut g Gen) sql_insert_expr(node ast.SqlExpr) {
 	g.sql_table_name = g.table.sym(node.table_expr.typ).name
 
 	// orm_insert needs an SqlStmtLine, build it from SqlExpr (most nodes are the same)
-	hack_stmt_line := ast.SqlStmtLine{
-		object_var: node.inserted_var
-		fields:     node.fields
-		table_expr: node.table_expr
-		// sub_structs: node.sub_structs
-	}
+	hack_stmt_line := g.build_sql_stmt_line_from_sql_expr(node)
 	g.write_orm_insert(hack_stmt_line, table_name, connection_var_name, result_var_name,
 		node.or_expr, table_attrs)
 
 	g.write2(left, 'orm__Connection_name_table[${connection_var_name}._typ]._method_last_id(${connection_var_name}._object)')
+}
+
+fn (mut g Gen) build_sql_stmt_line_from_sql_expr(node ast.SqlExpr) ast.SqlStmtLine {
+	mut sub_structs := map[int]ast.SqlStmtLine{}
+	for typ, sub in node.sub_structs {
+		sub_structs[typ] = g.build_sql_stmt_line_from_sql_expr(sub)
+	}
+	return ast.SqlStmtLine{
+		object_var:  node.inserted_var
+		fields:      node.fields
+		table_expr:  node.table_expr
+		sub_structs: sub_structs
+	}
 }
 
 // sql_stmt writes C code that calls ORM functions for
@@ -550,6 +558,7 @@ fn (mut g Gen) write_orm_insert_with_last_ids(node ast.SqlStmtLine, connection_v
 			last_ids := g.new_tmp_var()
 			res_ := g.new_tmp_var()
 			tmp_var := g.new_tmp_var()
+			g.writeln('Array_orm__Primitive ${last_ids} = builtin____new_array_with_default_noscan(0, 0, sizeof(orm__Primitive), 0);')
 			if is_option {
 				g.writeln('${ctyp} ${tmp_var} = (*(${ctyp}*)builtin__array_get(*(Array_${ctyp}*)${node.object_var}${member_access_type}${arr.object_var}.data, ${idx}));')
 			} else {
@@ -575,8 +584,6 @@ fn (mut g Gen) write_orm_insert_with_last_ids(node ast.SqlStmtLine, connection_v
 			unsafe { fff.free() }
 			g.write_orm_insert_with_last_ids(arr, connection_var_name, g.get_table_name_by_struct_type(arr.table_expr.typ),
 				last_ids, res_, id_name, fkeys[i], or_expr)
-			// Validates sub insertion success otherwise, handled and propagated error.
-			g.or_block(res_, or_expr, ast.int_type.set_flag(.result))
 			g.indent--
 			g.writeln('}')
 		}

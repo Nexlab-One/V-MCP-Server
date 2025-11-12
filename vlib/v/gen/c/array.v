@@ -96,7 +96,7 @@ fn (mut g Gen) fixed_array_init(node ast.ArrayInit, array_type Type, var_name st
 	array_info := array_type.unaliased_sym.array_fixed_info()
 	if node.has_index {
 		past := g.past_tmp_var_from_var_name(var_name)
-		defer {
+		defer(fn) {
 			g.past_tmp_var_done(past)
 		}
 
@@ -134,8 +134,8 @@ fn (mut g Gen) fixed_array_init(node ast.ArrayInit, array_type Type, var_name st
 	}
 	is_none := node.is_option && !node.has_init && !node.has_val
 
-	if (g.inside_struct_init && g.inside_cast && !g.inside_memset && !g.inside_opt_or_res)
-		|| (node.is_option && !is_none) {
+	if (g.inside_struct_init && g.inside_cast && !g.inside_memset && !g.inside_opt_or_res
+		&& !g.inside_sumtype_cast) || (node.is_option && !is_none) {
 		ret_typ_str := g.styp(node.typ)
 		g.write('(${ret_typ_str})')
 	}
@@ -150,7 +150,7 @@ fn (mut g Gen) fixed_array_init(node ast.ArrayInit, array_type Type, var_name st
 	if node.has_val {
 		tmp_inside_array := g.inside_array_item
 		g.inside_array_item = true
-		defer {
+		defer(fn) {
 			g.inside_array_item = tmp_inside_array
 		}
 		nelen := node.exprs.len
@@ -295,7 +295,7 @@ fn (mut g Gen) array_init_with_fields(node ast.ArrayInit, elem_type Type, is_amp
 	if node.has_index {
 		// []int{len: 6, init: index * index} when variable it is used in init expression
 		past := g.past_tmp_var_from_var_name(var_name)
-		defer {
+		defer(fn) {
 			g.past_tmp_var_done(past)
 		}
 
@@ -973,11 +973,12 @@ fn (mut g Gen) gen_array_filter(node ast.CallExpr) {
 	}
 
 	sym := g.table.final_sym(node.return_type)
-	if sym.kind != .array {
+	if sym.kind !in [.array_fixed, .array] {
 		verror('filter() requires an array')
 	}
 	info := sym.info as ast.Array
 	styp := g.styp(node.return_type)
+	left_sym := g.table.final_sym(node.left_type)
 	elem_type_str := g.styp(info.elem_type)
 	noscan := g.check_noscan(info.elem_type)
 	has_infix_left_var_name := g.write_prepared_tmp_value(past.tmp_var, node, styp, '{0}')
@@ -997,7 +998,7 @@ fn (mut g Gen) gen_array_filter(node ast.CallExpr) {
 	i := g.new_tmp_var()
 	g.writeln('for (${ast.int_type_name} ${i} = 0; ${i} < ${past.tmp_var}_len; ++${i}) {')
 	g.indent++
-	g.write_prepared_var(var_name, info.elem_type, elem_type_str, past.tmp_var, i, true,
+	g.write_prepared_var(var_name, info.elem_type, elem_type_str, past.tmp_var, i, left_sym.kind == .array,
 		false)
 	g.set_current_pos_as_last_stmt_pos()
 	mut is_embed_map_filter := false
@@ -1431,8 +1432,8 @@ fn (mut g Gen) gen_array_wait(node ast.CallExpr) {
 	thread_type := arr.array_info().elem_type
 	thread_sym := g.table.sym(thread_type)
 	thread_ret_type := thread_sym.thread_info().return_type
-	eltyp := g.table.sym(thread_ret_type).cname
-	fn_name := g.register_thread_array_wait_call(eltyp)
+	elsymcname := g.table.sym(thread_ret_type).cname
+	fn_name := g.register_thread_array_wait_call(elsymcname)
 	g.write('${fn_name}(')
 	if node.left_type.is_ptr() {
 		g.write('*')
@@ -1446,8 +1447,8 @@ fn (mut g Gen) gen_fixed_array_wait(node ast.CallExpr) {
 	thread_type := arr.array_fixed_info().elem_type
 	thread_sym := g.table.sym(thread_type)
 	thread_ret_type := thread_sym.thread_info().return_type
-	eltyp := g.table.sym(thread_ret_type).cname
-	fn_name := g.register_thread_fixed_array_wait_call(node, eltyp)
+	elsymcname := g.table.sym(thread_ret_type).cname
+	fn_name := g.register_thread_fixed_array_wait_call(node, elsymcname)
 	g.write('${fn_name}(')
 	g.expr(node.left)
 	g.write(')')
@@ -1840,7 +1841,7 @@ fn (mut g Gen) fixed_array_update_expr_field(expr_str string, field_type ast.Typ
 	elem_sym := g.table.sym(elem_type)
 	if !g.inside_array_fixed_struct {
 		g.write('{')
-		defer {
+		defer(fn) {
 			g.write('}')
 		}
 	}
@@ -1881,7 +1882,7 @@ fn (mut g Gen) fixed_array_var_init(expr_str string, is_auto_deref bool, elem_ty
 	elem_sym := g.table.sym(elem_type)
 	if !g.inside_array_fixed_struct {
 		g.write('{')
-		defer {
+		defer(fn) {
 			g.write('}')
 		}
 	}

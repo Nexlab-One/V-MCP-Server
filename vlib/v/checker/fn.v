@@ -502,7 +502,8 @@ fn (mut c Checker) fn_decl(mut node ast.FnDecl) {
 				node.stmts.last().pos
 			}
 			node.stmts << ast.Return{
-				pos: return_pos // node.pos
+				scope: node.scope
+				pos:   return_pos // node.pos
 			}
 		}
 	}
@@ -512,7 +513,8 @@ fn (mut c Checker) fn_decl(mut node ast.FnDecl) {
 		sym := c.table.sym(node.return_type)
 		if sym.kind == .void {
 			node.stmts << ast.Return{
-				pos: node.pos
+				scope: node.scope
+				pos:   node.pos
 			}
 		}
 	}
@@ -690,6 +692,8 @@ fn (mut c Checker) anon_fn(mut node ast.AnonFn) ast.Type {
 		} else {
 			parent_var.typ
 		}
+		node.has_ct_var = node.has_ct_var
+			|| var.name in [c.comptime.comptime_for_field_var, c.comptime.comptime_for_method_var]
 		if parent_var.typ != ast.no_type {
 			parent_var_sym := c.table.final_sym(ptyp)
 			if parent_var_sym.info is ast.FnType {
@@ -756,6 +760,9 @@ fn (mut c Checker) call_expr(mut node ast.CallExpr) ast.Type {
 		c.method_call(mut node, mut continue_check)
 	} else {
 		c.fn_call(mut node, mut continue_check)
+	}
+	if c.pref.is_vls {
+		c.autocomplete_for_fn_call_expr(node)
 	}
 	if !continue_check {
 		return ast.void_type
@@ -1152,6 +1159,9 @@ fn (mut c Checker) fn_call(mut node ast.CallExpr, mut continue_check &bool) ast.
 					func = f
 					node.name = qualified_name
 					unsafe { c.table.fns[qualified_name].usages++ }
+					if !c.table.register_fn_concrete_types(f.name, concrete_types) {
+						c.need_recheck_generic_fns = true
+					}
 					break
 				}
 			}
@@ -1530,7 +1540,7 @@ fn (mut c Checker) fn_call(mut node ast.CallExpr, mut continue_check &bool) ast.
 			if i == args_len - 1 {
 				c.check_variadic_arg(call_arg.expr, typ, expected_type, param.typ, i + 1,
 					func.name, func.is_method, func.is_variadic, args_len == 1 && i == 0,
-					node.pos, call_arg.pos)
+					func.generic_names.len > 0, node.pos, call_arg.pos)
 			}
 		} else {
 			c.expected_type = param.typ
@@ -1557,6 +1567,33 @@ fn (mut c Checker) fn_call(mut node ast.CallExpr, mut continue_check &bool) ast.
 		if c.comptime.comptime_for_field_var != '' {
 			if mut call_arg.expr is ast.Ident && call_arg.expr.obj is ast.Var {
 				node.args[i].typ = call_arg.expr.obj.typ
+			}
+		}
+		// sumtype coercion
+		param_type_sym := c.table.sym(param.typ)
+		if param_type_sym.kind == .placeholder {
+			base_type := c.table.find_type(param_type_sym.ngname)
+			if base_type != 0 {
+				base_sym := c.table.sym(base_type)
+				if base_sym.kind == .sum_type && base_sym.info is ast.SumType {
+					base_info := base_sym.info as ast.SumType
+					arg_typ_sym := c.table.sym(arg_typ)
+					for variant in base_info.variants {
+						variant_sym := c.table.sym(variant)
+						variant_base_name := variant_sym.ngname
+						if variant_base_name == arg_typ_sym.ngname {
+							node.args[i].expr = ast.CastExpr{
+								expr:    call_arg.expr
+								typ:     param.typ
+								typname: c.table.type_to_str(param.typ)
+								pos:     call_arg.expr.pos()
+							}
+							node.args[i].typ = param.typ
+							arg_typ = param.typ
+							break
+						}
+					}
+				}
 			}
 		}
 		arg_typ_sym := c.table.sym(arg_typ)
@@ -2542,8 +2579,8 @@ fn (mut c Checker) method_call(mut node ast.CallExpr, mut continue_check &bool) 
 			typ := c.expr(mut arg.expr)
 			if i == node.args.len - 1 {
 				c.check_variadic_arg(arg.expr, typ, expected_type, param.typ, i + 1, method.name,
-					true, method.is_variadic, node.args.len == 1 && i == 0, node.pos,
-					arg.pos)
+					true, method.is_variadic, node.args.len == 1 && i == 0, method.generic_names.len > 0,
+					node.pos, arg.pos)
 			}
 		} else {
 			c.expected_type = param.typ
@@ -2705,6 +2742,10 @@ fn (mut c Checker) method_call(mut node ast.CallExpr, mut continue_check &bool) 
 		node.receiver_type = left_type.derive(method.params[0].typ).set_flag(.generic)
 	} else {
 		node.receiver_type = method.params[0].typ
+	}
+	if node.receiver_type.has_flag(.shared_f) && !node.left_type.has_flag(.shared_f) {
+		c.error('cannot use shared method `${node.name}` as `${node.left}` is not a shared var',
+			node.left.pos())
 	}
 	// if receiver_type is T, then `receiver_concrete_type` is concrete type, otherwise it is the same as `receiver_type`.
 	node.receiver_concrete_type = if is_method_from_embed {
@@ -3319,8 +3360,16 @@ fn (mut c Checker) array_builtin_method_call(mut node ast.CallExpr, left_type as
 				node.args[i].typ = c.expr(mut arg.expr)
 				if i == val_arg_n {
 					arg_sym := c.table.sym(node.args[i].typ)
-					if !c.check_types(node.args[i].typ, info.elem_type)
-						&& !c.check_types(left_type, node.args[i].typ) {
+					base_arg_type := c.unwrap_generic(node.args[i].typ)
+					if c.check_types(base_arg_type, info.elem_type) {
+						if !base_arg_type.is_ptr() && info.elem_type.is_ptr()
+							&& info.elem_type.share() == .mut_t {
+							c.error('cannot ${method_name} `${arg_sym.name}` to `${left_sym.name}`',
+								arg.expr.pos())
+							continue
+						}
+					} else if !c.check_types(base_arg_type, unwrapped_left_type)
+						&& !c.check_types(elem_typ, base_arg_type) {
 						c.error('cannot ${method_name} `${arg_sym.name}` to `${left_sym.name}`',
 							arg.expr.pos())
 						continue
@@ -3665,6 +3714,16 @@ fn (mut c Checker) fixed_array_builtin_method_call(mut node ast.CallExpr, left_t
 		c.expr(mut arg0.expr)
 		c.check_predicate_param(false, elem_typ, node)
 		node.return_type = ast.int_type
+	} else if method_name == 'filter' {
+		if node_args_len != 1 {
+			c.error('`.${method_name}` expected 1 argument, but got ${node_args_len}',
+				node.pos)
+		}
+		// position of `it` doesn't matter
+		scope_register_it(mut node.scope, node.pos, elem_typ)
+		c.expr(mut arg0.expr)
+		c.check_predicate_param(false, elem_typ, node)
+		node.return_type = c.table.find_or_register_array(elem_typ)
 	} else if method_name == 'wait' {
 		elem_sym := c.table.sym(elem_typ)
 		if elem_sym.kind == .thread {
@@ -3970,11 +4029,11 @@ fn (mut c Checker) has_veb_context(typ ast.Type) bool {
 
 fn (mut c Checker) check_variadic_arg(arg_expr ast.Expr, typ ast.Type, expected_type ast.Type, param_typ ast.Type,
 	arg_num int, fn_name string, is_method bool, fn_is_variadic bool, is_single_array_arg bool,
-	call_pos token.Pos, arg_pos token.Pos) {
+	is_generic_fn bool, call_pos token.Pos, arg_pos token.Pos) {
 	kind := c.table.sym(typ).kind
 	is_decompose := arg_expr is ast.ArrayDecompose
 	mut allow_variadic_pass := false
-	if arg_expr is ast.Ident && !is_method {
+	if arg_expr is ast.Ident && !(is_method && is_generic_fn) {
 		ident := arg_expr as ast.Ident
 		if ident.obj is ast.Var {
 			var_obj := ident.obj as ast.Var

@@ -2100,6 +2100,27 @@ for mut num in numbers {
 println(numbers) // [1, 2, 3]
 ```
 
+By default, array elements are taken by value, if you need elements to be taken by
+reference, use `&` on the array you want to iterate over:
+
+```v
+struct User {
+	name string
+}
+
+users := [User{
+	name: 'someuserwow99'
+}, User{
+	name: 'visgod'
+}]
+// note `&users`, this is how a reference to the elements of the array is received
+for user in &users {
+	// some operations with `user`
+}
+```
+
+The same applies to maps.
+
 When an identifier is just a single underscore, it is ignored.
 
 ##### Custom iterators
@@ -2280,25 +2301,27 @@ The above code prints:
 
 ### Defer
 
-A defer statement defers the execution of a block of statements
-until the surrounding function returns.
+A `defer {}` statement, defers the execution of the block of statements
+until the surrounding scope of the defer ends. It is a convenient feature
+that allows you to group related actions (getting access to a resource
+and cleaning/freeing it after you are done) closely together, instead
+of spreading them across multiple potentially very remote lines of code.
 
 ```v
 import os
 
-fn read_log() {
+fn read_log() ! {
 	mut ok := false
-	mut f := os.open('log.txt') or { panic(err) }
-	defer {
-		f.close()
-	}
+	mut f := os.open('log.txt')!
+	defer { f.close() }
 	// ...
 	if !ok {
+		// ...
 		// defer statement will be called here, the file will be closed
 		return
 	}
 	// ...
-	// defer statement will be called here, the file will be closed
+	// defer statement will be called here too, the file will be closed
 }
 ```
 
@@ -2380,6 +2403,52 @@ fn (mut app App) auth_with_user_middleware() (bool, string) {
 	return true, 'TestUser'
 }
 ```
+
+#### defer in loop scopes:
+Defer can be used inside loops too, and the deferred statement will be executed once for each
+iteration. You can also have multiple defer statements in the same scope, in which case, they
+will be executed in reverse order of their appearance in the source code:
+```v
+fn main() {
+	defer { println('Program finish.') }
+	println('Loop start.')
+	for i in 1 .. 4 {
+		defer { println('Deferred execution for ${i}. Defer 1.') }
+		defer { println('Deferred execution for ${i}. Defer 2.') }
+		defer { println('Deferred execution for ${i}. Defer 3.') }
+		println('Loop iteration: ${i}')
+	}
+	println('Loop done.')
+}
+```
+
+The example will print this:
+```txt
+Loop start.
+Loop iteration: 1
+Deferred execution for 1. Defer 3.
+Deferred execution for 1. Defer 2.
+Deferred execution for 1. Defer 1.
+Loop iteration: 2
+Deferred execution for 2. Defer 3.
+Deferred execution for 2. Defer 2.
+Deferred execution for 2. Defer 1.
+Loop iteration: 3
+Deferred execution for 3. Defer 3.
+Deferred execution for 3. Defer 2.
+Deferred execution for 3. Defer 1.
+Loop done.
+Program finish.
+```
+
+#### defer(fn) {}
+
+Note, that in most of the examples above, the `defer{}` statement was directly inside
+a function scope, so it was executed when the function itself returned. Sometimes, you
+need to defer a statement to execute right at the function end (like the above), even
+if you are inside an inner scope (deep inside an `if` or `for`).
+
+For these more rare cases, you can use: `defer(fn) {}` instead of just `defer {}`.
 
 ### Goto
 
@@ -6161,20 +6230,14 @@ Another example, is if you want to embed the version/name from v.mod *inside* yo
 
 ```v ignore
 import v.vmod
-vm := vmod.decode( @VMOD_FILE ) or { panic(err) }
-eprintln('${vm.name} ${vm.version}\n ${vm.description}')
+
+vm := vmod.decode( @VMOD_FILE )!
+eprintln('${vm.name} ${vm.version}\n${vm.description}')
 ```
 
 A program that prints its own source code (a quine):
 ```v
 print($embed_file(@FILE).to_string())
-```
-
-A program that prints the time when it was built:
-```v
-import time
-
-println('This program, was compiled at ${time.unix(@BUILD_TIMESTAMP.i64()).format_ss_milli()} .')
 ```
 
 > [!NOTE]
@@ -6183,6 +6246,12 @@ println('This program, was compiled at ${time.unix(@BUILD_TIMESTAMP.i64()).forma
 > is done with `print` and not `println`, to not add another new line, missing in the
 > source code.
 
+A program that prints the time when it was built:
+```v
+import time
+
+println('This program, was compiled at ${time.unix(@BUILD_TIMESTAMP.i64()).format_ss_milli()} .')
+```
 
 ### Compile time reflection
 
@@ -6625,9 +6694,12 @@ V supports the following compile time types:
 - `$interface` => matches [Interfaces](#interfaces).
 - `$map` => matches [Maps](#maps).
 - `$option` => matches [Option Types](#optionresult-types-and-error-handling).
+- `$shared` => matches [Shared Types](#shared-objects).
 - `$struct` => matches [Structs](#structs).
 - `$sumtype` => matches [Sum Types](#sum-types).
 - `$string` => matches [Strings](#strings).
+- `$pointer` => matches [Reference Types](#references).
+- `$voidptr` => matches C's `void*`.
 
 ### Environment specific files
 

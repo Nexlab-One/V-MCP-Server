@@ -14,7 +14,7 @@ fn (mut c Checker) match_expr(mut node ast.MatchExpr) ast.Type {
 	}
 	if node.is_expr {
 		c.expected_expr_type = c.expected_type
-		defer {
+		defer(fn) {
 			c.expected_expr_type = ast.void_type
 		}
 	}
@@ -231,6 +231,25 @@ fn (mut c Checker) match_expr(mut node ast.MatchExpr) ast.Type {
 				c.table.comptime_is_true[idx_str] = ast.ComptTimeCondResult{
 					val:   comptime_match_branch_result
 					c_str: ''
+				}
+			}
+		}
+
+		if !c.pref.translated && !c.file.is_translated {
+			// check for always true/false match branch
+			for mut expr in branch.exprs {
+				mut check_expr := ast.InfixExpr{
+					op:    .eq
+					left:  node.cond
+					right: expr
+				}
+				t_expr := c.checker_transformer.expr(mut check_expr)
+				if t_expr is ast.BoolLiteral {
+					if t_expr.val {
+						c.note('match is always true', expr.pos())
+					} else {
+						c.note('match is always false', expr.pos())
+					}
 				}
 			}
 		}

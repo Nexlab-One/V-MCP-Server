@@ -52,7 +52,7 @@ fn (mut p Parser) call_expr(language ast.Language, mod string) ast.CallExpr {
 	}
 	p.check(.lpar)
 	args := p.call_args()
-	if p.tok.kind != .rpar {
+	if p.tok.kind != .rpar && !p.pref.is_vls {
 		params := p.table.fns[fn_name] or { unsafe { p.table.fns['${p.mod}.${fn_name}'] } }.params
 		if args.len < params.len && p.prev_tok.kind != .comma {
 			pos := if p.tok.kind == .eof { p.prev_tok.pos() } else { p.tok.pos() }
@@ -61,7 +61,7 @@ fn (mut p Parser) call_expr(language ast.Language, mod string) ast.CallExpr {
 			ok_arg_pos := (args[params.len - 1] or { args[0] }).pos
 			pos := token.Pos{
 				...ok_arg_pos
-				col: ok_arg_pos.col + ok_arg_pos.len
+				col: u16(ok_arg_pos.col + ok_arg_pos.len)
 			}
 			p.unexpected_with_pos(pos.extend(p.tok.pos()), expecting: '`)`')
 		} else {
@@ -70,11 +70,13 @@ fn (mut p Parser) call_expr(language ast.Language, mod string) ast.CallExpr {
 		}
 	}
 	last_pos := p.tok.pos()
-	p.next()
+	if p.tok.kind == .rpar {
+		p.next()
+	}
 	mut pos := first_pos.extend(last_pos)
 	mut or_stmts := []ast.Stmt{} // TODO: remove unnecessary allocations by just using .absent
 	mut or_pos := p.tok.pos()
-	mut or_scope := &ast.Scope(unsafe { nil })
+	mut or_scope := ast.empty_scope
 	if p.tok.kind == .key_orelse {
 		// `foo() or {}``
 		or_kind = .block
@@ -88,6 +90,7 @@ fn (mut p Parser) call_expr(language ast.Language, mod string) ast.CallExpr {
 			p.error_with_pos('error propagation not allowed inside `defer` blocks', p.prev_tok.pos())
 		}
 		or_kind = if is_not { .propagate_result } else { .propagate_option }
+		or_scope = p.scope
 	}
 	if p.is_imported_symbol(fn_name) {
 		check := !p.imported_symbols_used[fn_name]
@@ -301,6 +304,11 @@ fn (mut p Parser) fn_decl() ast.FnDecl {
 		p.next()
 	}
 	p.check(.key_fn)
+	mut comments_before_key_fn := if p.pref.is_vls {
+		p.cur_comments.clone()
+	} else {
+		[]
+	}
 	comments << p.eat_comments()
 	p.open_scope()
 	defer {
@@ -676,7 +684,11 @@ run them via `v file.v` instead',
 		p.inside_fn = true
 		p.inside_unsafe_fn = is_unsafe
 		p.cur_fn_scope = p.scope
-		stmts = p.parse_block_no_scope(true)
+		if p.is_vls_skip_file {
+			p.skip_scope()
+		} else {
+			stmts = p.parse_block_no_scope(true)
+		}
 		p.cur_fn_scope = last_fn_scope
 		p.inside_unsafe_fn = false
 		p.inside_fn = false
@@ -753,6 +765,20 @@ run them via `v file.v` instead',
 		p.table.register_fn_generic_types(fn_decl.fkey())
 	}
 	p.label_names = []
+	if p.pref.is_vls {
+		type_str := if (is_method || is_static_type_method) && rec.typ != ast.no_type {
+			p.table.sym(rec.typ.idx_type()).name.all_after_last('.')
+		} else {
+			''
+		}
+		key := 'fn_${p.mod}[${type_str}]${short_fn_name}'
+		val := ast.VlsInfo{
+			pos: fn_decl.pos
+			doc: p.keyword_comments_to_string(short_fn_name, comments_before_key_fn) +
+				p.comments_to_string(fn_decl.end_comments)
+		}
+		p.table.register_vls_info(key, val)
+	}
 	return fn_decl
 }
 

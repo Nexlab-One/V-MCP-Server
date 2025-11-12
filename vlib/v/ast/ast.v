@@ -163,6 +163,7 @@ pub enum ComptimeTypeKind {
 	alias
 	function
 	option
+	shared
 	string
 	pointer
 	voidptr
@@ -190,6 +191,7 @@ pub fn (cty ComptimeType) str() string {
 		.alias { '\$alias' }
 		.function { '\$function' }
 		.option { '\$option' }
+		.shared { '\$shared' }
 		.string { '\$string' }
 		.pointer { '\$pointer' }
 		.voidptr { '\$voidptr' }
@@ -219,6 +221,7 @@ pub struct Block {
 pub:
 	is_unsafe bool
 	pos       token.Pos
+	scope     &Scope
 pub mut:
 	stmts []Stmt
 }
@@ -572,6 +575,7 @@ pub struct AnonFn {
 pub mut:
 	decl           FnDecl
 	inherited_vars []Param         // note: closures have inherited_vars.len > 0
+	has_ct_var     bool            // has $for var as inherited var
 	typ            Type            // the type of anonymous fn. Both .typ and .decl.name are auto generated
 	has_gen        map[string]bool // a map of the names of all generic anon functions, generated from it
 }
@@ -805,6 +809,7 @@ pub struct BranchStmt {
 pub:
 	kind  token.Kind
 	label string
+	scope &Scope
 	pos   token.Pos
 }
 
@@ -884,6 +889,7 @@ pub mut:
 // function return statement
 pub struct Return {
 pub:
+	scope    &Scope
 	pos      token.Pos
 	comments []Comment
 pub mut:
@@ -1323,6 +1329,7 @@ pub:
 	is_else       bool
 	is_timeout    bool
 	post_comments []Comment
+	scope         &Scope
 pub mut:
 	stmt  Stmt   // `a := <-ch` or `ch <- a`
 	stmts []Stmt // right side
@@ -1343,6 +1350,7 @@ pub:
 	kind    ComptimeForKind
 	pos     token.Pos
 	typ_pos token.Pos
+	scope   &Scope = unsafe { nil }
 pub mut:
 	stmts []Stmt
 	typ   Type
@@ -1539,13 +1547,20 @@ pub:
 	is_markused   bool
 }
 
+pub enum DeferMode {
+	scoped // default
+	function
+}
+
 // TODO: handle this differently
 // v1 excludes non current os ifdefs so
 // the defer's never get added in the first place
 @[minify]
 pub struct DeferStmt {
 pub:
-	pos token.Pos
+	pos   token.Pos
+	scope &Scope
+	mode  DeferMode
 pub mut:
 	stmts      []Stmt
 	defer_vars []Ident
@@ -2478,7 +2493,7 @@ pub fn (node Node) pos() token.Pos {
 						line_nr:   -1
 						pos:       -1
 						last_line: -1
-						col:       -1
+						col:       0
 					}
 				}
 			}

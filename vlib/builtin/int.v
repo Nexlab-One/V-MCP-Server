@@ -340,6 +340,22 @@ pub fn (nn u8) hex() string {
 	return u64_to_hex(nn, 2)
 }
 
+// hex returns a hexadecimal representation of `c` (as an 8 bit unsigned number).
+// The output is zero padded for values below 16.
+// Example: assert char(`A`).hex() == '41'
+// Example: assert char(`Z`).hex() == '5a'
+// Example: assert char(` `).hex() == '20'
+pub fn (c char) hex() string {
+	return u8(c).hex()
+}
+
+// hex returns a hexadecimal representation of the rune `r` (as a 32 bit unsigned number).
+// Example: assert `A`.hex() == '41'
+// Example: assert `💣`.hex() == '1f4a3'
+pub fn (r rune) hex() string {
+	return u32(r).hex()
+}
+
 // hex returns the value of the `i8` as a hexadecimal `string`.
 // Note that the output is zero padded for values below 16.
 // Example: assert i8(8).hex() == '08'
@@ -588,7 +604,7 @@ pub fn (b u8) repeat(count int) string {
 	mut bytes := unsafe { malloc_noscan(count + 1) }
 	unsafe {
 		vmemset(bytes, b, count)
-		bytes[count] = `0`
+		bytes[count] = 0
 	}
 	return unsafe { bytes.vstring_with_len(count) }
 }
