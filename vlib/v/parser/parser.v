@@ -30,6 +30,7 @@ mut:
 	peek_tok                 token.Token
 	language                 ast.Language
 	fn_language              ast.Language // .c for `fn C.abcd()` declarations
+	struct_language          ast.Language // for `struct C.abcd{ embedded struct/union }` declarations
 	expr_level               int          // prevent too deep recursions for pathological programs
 	inside_vlib_file         bool         // true for all vlib/ files
 	inside_test_file         bool         // when inside _test.v or _test.vv file
@@ -132,6 +133,14 @@ pub mut:
 	warnings       []errors.Warning
 	notices        []errors.Notice
 	template_paths []string // record all compiled $tmpl files; needed for `v watch run webserver.v`
+	content        ParseContentKind
+}
+
+enum ParseContentKind {
+	file
+	text
+	stmt
+	comptime
 }
 
 // for tests
@@ -140,6 +149,7 @@ pub fn parse_stmt(text string, mut table ast.Table, mut scope ast.Scope) ast.Stm
 		eprintln('> ${@MOD}.${@FN} text: ${text}')
 	}
 	mut p := Parser{
+		content:          .stmt
 		scanner:          scanner.new_scanner(text, .skip_comments, &pref.Preferences{})
 		inside_test_file: true
 		table:            table
@@ -160,6 +170,7 @@ pub fn parse_comptime(tmpl_path string, text string, mut table ast.Table, pref_ 
 		eprintln('> ${@MOD}.${@FN} text: ${text}')
 	}
 	mut p := Parser{
+		content:   .comptime
 		file_path: tmpl_path
 		scanner:   scanner.new_scanner(text, .skip_comments, pref_)
 		table:     table
@@ -179,6 +190,7 @@ pub fn parse_text(text string, path string, mut table ast.Table, comments_mode s
 		eprintln('> ${@MOD}.${@FN} comments_mode: ${comments_mode:-20} | path: ${path:-20} | text: ${text}')
 	}
 	mut p := Parser{
+		content:          .text
 		scanner:          scanner.new_scanner(text, comments_mode, pref_)
 		table:            table
 		pref:             pref_
@@ -267,6 +279,7 @@ pub fn parse_file(path string, mut table ast.Table, comments_mode scanner.Commen
 		table.filelist << path
 	}
 	mut p := Parser{
+		content: .file
 		scanner: scanner.new_scanner_file(path, file_idx, comments_mode, pref_) or { panic(err) }
 		table:   table
 		pref:    pref_
@@ -289,6 +302,9 @@ pub fn parse_file(path string, mut table ast.Table, comments_mode scanner.Commen
 }
 
 pub fn (mut p Parser) parse() &ast.File {
+	$if trace_parse ? {
+		eprintln('> ${@FILE}:${@LINE} | p.path: ${p.file_path} | content: ${p.content} | nr_tokens: ${p.scanner.all_tokens.len} | nr_lines: ${p.scanner.line_nr} | nr_bytes: ${p.scanner.text.len}')
+	}
 	util.timing_start('PARSE')
 	defer {
 		util.timing_measure_cumulative('PARSE')
@@ -530,14 +546,9 @@ fn (mut p Parser) mark_last_call_return_as_used(mut last_stmt ast.Stmt) {
 				ast.CallExpr {
 					// last stmt on block is CallExpr
 					last_stmt.expr.is_return_used = true
-				}
-				ast.IfExpr {
-					// last stmt on block is: if .. { foo() } else { bar() }
-					for mut branch in last_stmt.expr.branches {
-						if branch.stmts.len > 0 {
-							mut last_if_stmt := branch.stmts.last()
-							p.mark_last_call_return_as_used(mut last_if_stmt)
-						}
+					if last_stmt.expr.or_block.stmts.len > 0 {
+						mut or_block_last_stmt := last_stmt.expr.or_block.stmts.last()
+						p.mark_last_call_return_as_used(mut or_block_last_stmt)
 					}
 				}
 				ast.ConcatExpr {
@@ -548,18 +559,45 @@ fn (mut p Parser) mark_last_call_return_as_used(mut last_stmt ast.Stmt) {
 						}
 					}
 				}
+				ast.IfExpr {
+					// last stmt on block is: if .. { foo() } else { bar() }
+					for mut branch in last_stmt.expr.branches {
+						if branch.stmts.len > 0 {
+							mut last_if_stmt := branch.stmts.last()
+							p.mark_last_call_return_as_used(mut last_if_stmt)
+						}
+					}
+				}
 				ast.InfixExpr {
+					if last_stmt.expr.or_block.stmts.len > 0 {
+						mut or_block_last_stmt := last_stmt.expr.or_block.stmts.last()
+						p.mark_last_call_return_as_used(mut or_block_last_stmt)
+					}
 					// last stmt has infix expr with CallExpr: foo()? + 'a'
 					mut left_expr := last_stmt.expr.left
 					for {
 						if mut left_expr is ast.InfixExpr {
+							if left_expr.or_block.stmts.len > 0 {
+								mut or_block_last_stmt := left_expr.or_block.stmts.last()
+								p.mark_last_call_return_as_used(mut or_block_last_stmt)
+							}
 							left_expr = left_expr.left
 							continue
 						}
 						if mut left_expr is ast.CallExpr {
 							left_expr.is_return_used = true
+							if left_expr.or_block.stmts.len > 0 {
+								mut or_block_last_stmt := left_expr.or_block.stmts.last()
+								p.mark_last_call_return_as_used(mut or_block_last_stmt)
+							}
 						}
 						break
+					}
+				}
+				ast.ComptimeCall, ast.ComptimeSelector, ast.PrefixExpr, ast.SelectorExpr {
+					if last_stmt.expr.or_block.stmts.len > 0 {
+						mut or_block_last_stmt := last_stmt.expr.or_block.stmts.last()
+						p.mark_last_call_return_as_used(mut or_block_last_stmt)
 					}
 				}
 				else {}
@@ -2164,8 +2202,7 @@ fn (mut p Parser) dot_expr(left ast.Expr) ast.Expr {
 	} else {
 		p.name_error = true
 	}
-	is_filter := field_name in ['filter', 'map', 'any', 'all', 'count']
-	if is_filter || field_name == 'sort' || field_name == 'sorted' {
+	if ast.builtin_array_generic_methods_matcher.matches(field_name) {
 		if p.file_backend_mode == .v || p.file_backend_mode == .c {
 			p.register_auto_import('builtin.closure')
 		}

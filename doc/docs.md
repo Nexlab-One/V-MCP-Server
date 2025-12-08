@@ -921,16 +921,16 @@ f2 := 456e+2 // 45600
 
 An array is a collection of data elements of the same type. An array literal is a
 list of expressions surrounded by square brackets. An individual element can be
-accessed using an *index* expression. Indexes start from `0`:
+accessed using an *index* expression. Indexing starts from `0`.
 
 ```v
-mut nums := [1, 2, 3]
-println(nums) // `[1, 2, 3]`
-println(nums[0]) // `1`
-println(nums[1]) // `2`
+mut nums := [10, 20, 30]
+println(nums) // `[10, 20, 30]`
+println(nums[0]) // `10`
+println(nums[1]) // `20`
 
 nums[1] = 5
-println(nums) // `[1, 5, 3]`
+println(nums) // `[10, 5, 30]`
 ```
 
 <a id='array-operations'></a>
@@ -4214,8 +4214,8 @@ fn pass_time(w World) {
 
 ### Option/Result types and error handling
 
-Option types are for types which may represent `none`. Result types may
-represent an error returned from a function.
+Option types can represent a value or `none`. Result types may
+represent a value, or an error returned from a function.
 
 `Option` types are declared by prepending `?` to the type name: `?Type`.
 `Result` types use `!`: `!Type`.
@@ -4467,9 +4467,9 @@ post := posts_repo.find_by_id(1)? // find_by_id[Post]
 ```
 
 Currently generic function definitions must declare their type parameters, but in
-future V will infer generic type parameters from single-letter type names in
-runtime parameter types. This is why `find_by_id` can omit `[T]`, because the
-receiver argument `r` uses a generic type `T`.
+future versions, V will infer generic type parameters from single-letter type names in
+runtime parameter types. This is why the `find_by_id(1)` calls above can omit `[T]`,
+because the receiver argument `r` in the method declaration, uses a generic type `T`.
 
 Another example:
 
@@ -5135,10 +5135,11 @@ Remaining small percentage of objects is freed via GC. The developer doesn't nee
 anything in their code. "It just works", like in Python, Go, or Java, except there's no
 heavy GC tracing everything or expensive RC for each object.
 
-For developers willing to have more low level control, memory can be managed manually with
+For developers willing to have more low-level control, memory can be managed manually with
 `-gc none`.
 
-Arena allocation is available via v `-prealloc`.
+Arena allocation is available via a `-prealloc` flag. Note: currently this mode is only
+suitable to speed up short lived, single-threaded, batch-like programs (like compilers).
 
 ### Control
 
@@ -5159,7 +5160,7 @@ Just as the compiler frees C data types with C's `free()`, it will statically in
 
 Autofree can be enabled with an `-autofree` flag.
 
-For developers willing to have more low level control, autofree can be disabled with
+For developers willing to have more low-level control, autofree can be disabled with
 `-manualfree`, or by adding a `[manualfree]` on each function that wants to manage its
 memory manually. (See [attributes](#attributes)).
 
@@ -5232,7 +5233,7 @@ be stored:
 
 #### V's default approach
 
-Due to performance considerations V tries to put objects on the stack if possible
+Due to performance considerations V tries to put objects on the stack if possible,
 but allocates them on the heap when obviously necessary. Example:
 
 ```v
@@ -5566,6 +5567,31 @@ sql db {
 ```
 
 For more examples and the docs, see [vlib/orm](https://github.com/vlang/v/tree/master/vlib/orm).
+
+### Troubleshooting compilation problems with SQLite on Windows
+On Windows, if you get a compilation error, about a missing sqlite3.h file, you have to run:
+`v vlib/db/sqlite/install_thirdparty_sqlite.vsh` once, then retry your compilation.
+
+### Using the self contained SQLite module
+V also maintains a separate `sqlite` module, that wraps an SQLite amalgamation, but otherwise
+has the same API as the `db.sqlite` module. Its benefit, is that with it, you do not need to
+install a separate system level sqlite package/library on your system (which can be hard on
+some systems like windows, or systems with musl for example).
+Its negative is that it can make your compilations a bit slower (since it compiles SQLite
+from C, in addition to your own code).
+
+To use it, do:
+```sh
+v install sqlite
+```
+and later, in your code, use this:
+```v ignore
+import sqlite
+```
+instead of:
+```v ignore
+import db.sqlite
+```
 
 ## Writing Documentation
 
@@ -7410,7 +7436,7 @@ rm pgo_gen
 
 ## Atomics
 
-V has no special support for atomics, yet, nevertheless it's possible to treat variables as atomics
+V has no special support for atomics yet, nevertheless it's possible to treat variables as atomics
 by [calling C](#v-and-c) functions from V. The standard C11 atomic functions like `atomic_store()`
 are usually defined with the help of macros and C compiler magic to provide a kind of
 *overloaded C functions*.
@@ -7499,7 +7525,7 @@ will hang &ndash; dependent on the compiler optimization used.)
 
 ## Global Variables
 
-By default V does not allow global variables. However, in low level applications they have their
+By default V does not allow global variables. However, in low-level applications they have their
 place so their usage can be enabled with the compiler flag `-enable-globals`.
 Declarations of global variables must be surrounded with a `__global ( ... )`
 specification &ndash; as in the example [above](#atomics).
@@ -7550,7 +7576,7 @@ namespaced globals).
 
 Note: their use is discouraged too, for reasons similar to why globals
 are discouraged. The feature is supported to enable translating existing
-low level C code into V code, using `v translate`.
+low-level C code into V code, using `v translate`.
 
 Note: the function in which you use a static variable, has to be marked
 with @[unsafe]. Also unlike using globals, using static variables, do not
@@ -7603,7 +7629,7 @@ v -os freebsd .
 > Cross-compiling a Windows binary on a Linux machine requires the GNU C compiler for
 > MinGW-w64 (targeting Win64) to first be installed.
 
-For Ubuntu/Debian based distributions:
+For Ubuntu/Debian-based distributions:
 
 ```shell
 sudo apt install gcc-mingw-w64-x86-64
@@ -7632,7 +7658,7 @@ To debug issues in the generated binary (flag: `-b c`), you can pass these flags
 - `-g` - produces a less optimized executable with more debug information in it.
   V will enforce line numbers from the .v files in the stacktraces, that the
   executable will produce on panic. It is usually better to pass -g, unless
-  you are writing low level code, in which case use the next option `-cg`.
+  you are writing low-level code, in which case use the next option `-cg`.
 - `-cg` - produces a less optimized executable with more debug information in it.
   The executable will use C source line numbers in this case. It is frequently
   used in combination with `-keepc`, so that you can inspect the generated
@@ -7645,7 +7671,7 @@ To debug issues in the generated binary (flag: `-b c`), you can pass these flags
   compilation. Also keep using the same file path, so it is more stable,
   and easier to keep opened in an editor/IDE.
 
-For best debugging experience if you are writing a low level wrapper for an existing
+For best debugging experience if you are writing a low-level wrapper for an existing
 C library, you can pass several of these flags at the same time:
 `v -keepc -cg -showcc yourprogram.v`, then just run your debugger (gdb/lldb) or IDE
 on the produced executable `yourprogram`.

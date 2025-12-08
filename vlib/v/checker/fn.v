@@ -1524,6 +1524,20 @@ fn (mut c Checker) fn_call(mut node ast.CallExpr, mut continue_check &bool) ast.
 			}
 		}
 		has_decompose = call_arg.expr is ast.ArrayDecompose
+		if !func.is_variadic && call_arg.expr is ast.ArrayDecompose {
+			if mut call_arg.expr is ast.ArrayDecompose {
+				if call_arg.expr.expr is ast.ArrayInit {
+					extra_params := func.params.len - i
+					array_init := call_arg.expr.expr as ast.ArrayInit
+					if array_init.exprs.len < extra_params {
+						elem_word := if array_init.exprs.len == 1 { 'element' } else { 'elements' }
+						verb_word := if extra_params == 1 { 'is' } else { 'are' }
+						c.error('array decompose has ${array_init.exprs.len} ${elem_word} but ${extra_params} ${verb_word} needed for `${func.name}`',
+							call_arg.pos)
+					}
+				}
+			}
+		}
 		already_checked := node.language != .js && call_arg.expr is ast.CallExpr
 		if func.is_variadic && param_i >= func.params.len - 1 {
 			param_sym := c.table.sym(param.typ)
@@ -2890,6 +2904,9 @@ fn (mut c Checker) set_node_expected_arg_types(mut node ast.CallExpr, func &ast.
 			node.expected_arg_types << func.params[i].typ
 		}
 	}
+	if func.generic_names.len > 0 {
+		node.expected_arg_types.map(c.unwrap_generic(it))
+	}
 }
 
 fn (mut c Checker) post_process_generic_fns() ! {
@@ -2940,6 +2957,7 @@ fn (mut c Checker) check_expected_arg_count(mut node ast.CallExpr, f &ast.Fn) ! 
 	}
 	if f.is_variadic {
 		node.is_variadic = f.is_variadic
+		node.is_c_variadic = f.is_c_variadic
 		min_required_params--
 		c.markused_array_method(!c.is_builtin_mod, '')
 	} else {
@@ -3306,7 +3324,7 @@ fn (mut c Checker) array_builtin_method_call(mut node ast.CallExpr, left_type as
 	elem_typ = array_info.elem_type
 	node_args_len := node.args.len
 	mut arg0 := if node_args_len > 0 { node.args[0] } else { ast.CallArg{} }
-	if method_name in ['filter', 'map', 'any', 'all', 'count'] {
+	if ast.builtin_array_generic_methods_no_sort_matcher.matches(method_name) {
 		if node_args_len > 0 && mut arg0.expr is ast.LambdaExpr {
 			if arg0.expr.params.len != 1 {
 				c.error('lambda expressions used in the builtin array methods require exactly 1 parameter',

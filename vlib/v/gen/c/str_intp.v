@@ -191,6 +191,11 @@ fn (mut g Gen) str_val(node ast.StringInterLiteral, i int, fmts []u8) {
 	fmt := fmts[i]
 	typ := g.unwrap_generic(node.expr_types[i])
 	typ_sym := g.table.sym(typ)
+	if g.comptime.inside_comptime_for && expr is ast.SelectorExpr && expr.field_name == 'name'
+		&& expr.expr is ast.TypeOf {
+		g.expr(expr)
+		return
+	}
 	if typ == ast.string_type && g.comptime.comptime_for_method == unsafe { nil } {
 		if g.inside_vweb_tmpl {
 			g.write('${g.vweb_filter_fn_name}(')
@@ -215,7 +220,8 @@ fn (mut g Gen) str_val(node ast.StringInterLiteral, i int, fmts []u8) {
 		g.write2('${dot}_object', ')')
 	} else if fmt == `s` || typ.has_flag(.variadic) {
 		mut exp_typ := typ
-		if expr is ast.Ident {
+		is_comptime_for_var := expr is ast.Ident && g.is_comptime_for_var(expr)
+		if !is_comptime_for_var && expr is ast.Ident {
 			if g.comptime.get_ct_type_var(expr) == .smartcast {
 				exp_typ = g.type_resolver.get_type(expr)
 			} else if expr.obj is ast.Var {
@@ -231,7 +237,17 @@ fn (mut g Gen) str_val(node ast.StringInterLiteral, i int, fmts []u8) {
 				}
 			}
 		}
-		g.gen_expr_to_string(expr, exp_typ)
+		if exp_typ.has_flag(.option) && expr is ast.Ident && g.is_comptime_for_var(expr) {
+			str_fn_name := g.get_str_fn(exp_typ.clear_flag(.option))
+			g.write('${str_fn_name}(*(${g.base_type(exp_typ)}*)(')
+			old_inside_opt_or_res := g.inside_opt_or_res
+			g.inside_opt_or_res = true
+			g.expr(expr)
+			g.inside_opt_or_res = old_inside_opt_or_res
+			g.write('.data))')
+		} else {
+			g.gen_expr_to_string(expr, exp_typ)
+		}
 	} else if typ.is_number() || typ.is_pointer() || fmt == `d` {
 		if typ.is_signed() && fmt in [`x`, `X`, `o`] {
 			// convert to unsigned first befors C's integer propagation strikes
@@ -278,8 +294,26 @@ fn (mut g Gen) string_inter_literal(node ast.StringInterLiteral) {
 	mut node_ := unsafe { node }
 	mut fmts := node_.fmts.clone()
 	for i, mut expr in node_.exprs {
-		if g.comptime.is_comptime(expr) {
-			ctyp := g.type_resolver.get_type_or_default(expr, node_.expr_types[i])
+		mut field_typ := if mut expr is ast.Ident && g.is_comptime_for_var(expr) {
+			g.comptime.comptime_for_field_type
+		} else {
+			node_.expr_types[i]
+		}
+		if g.comptime.inside_comptime_for && mut expr is ast.SelectorExpr {
+			if expr.expr is ast.TypeOf && expr.field_name == 'name' {
+				typeof_expr := expr.expr as ast.TypeOf
+				if typeof_expr.expr is ast.Ident {
+					ident_name := (typeof_expr.expr as ast.Ident).name
+					if obj := typeof_expr.expr.scope.find(ident_name) {
+						if obj is ast.Var {
+							field_typ = obj.typ
+						}
+					}
+				}
+			}
+		}
+		if g.comptime.is_comptime(expr) || (g.comptime.inside_comptime_for && expr is ast.Ident) {
+			ctyp := g.type_resolver.get_type_or_default(expr, field_typ)
 			if ctyp != ast.void_type {
 				node_.expr_types[i] = ctyp
 				if node_.fmts[i] == `_` {
@@ -292,6 +326,8 @@ fn (mut g Gen) string_inter_literal(node ast.StringInterLiteral) {
 					fmts[i] = g.get_default_fmt(ctyp, typ)
 				}
 			}
+		} else {
+			node_.expr_types[i] = field_typ
 		}
 	}
 	g.write2('builtin__str_intp(', node.vals.len.str())

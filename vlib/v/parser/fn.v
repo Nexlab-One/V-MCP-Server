@@ -473,10 +473,19 @@ fn (mut p Parser) fn_decl() ast.FnDecl {
 			}
 		}
 	}
+	if generic_names.len > 0 {
+		for fna in fn_attrs {
+			if fna.name == 'export' {
+				p.error_with_pos('generic functions cannot be exported', fna.pos)
+				break
+			}
+		}
+	}
 	// Params
 	params_t, are_params_type_only, mut is_variadic, mut is_c_variadic := p.fn_params()
 	if is_c2v_variadic {
 		is_variadic = true
+		is_c_variadic = true
 	}
 	params << params_t
 	// Return type
@@ -1039,6 +1048,10 @@ fn (mut p Parser) fn_params() ([]ast.Param, bool, bool, bool) {
 				// error is added in parse_type
 				return []ast.Param{}, false, false, false
 			}
+			if param_type == ast.chan_type {
+				p.chan_type_error()
+				return []ast.Param{}, false, false, false
+			}
 			if is_mut {
 				if !param_type.has_flag(.generic) {
 					if is_variadic {
@@ -1167,6 +1180,10 @@ fn (mut p Parser) fn_params() ([]ast.Param, bool, bool, bool) {
 			type_pos[0] = pos.extend(p.prev_tok.pos())
 			if typ == 0 {
 				// error is added in parse_type
+				return []ast.Param{}, false, false, false
+			}
+			if typ == ast.chan_type {
+				p.chan_type_error()
 				return []ast.Param{}, false, false, false
 			}
 			if is_mut {

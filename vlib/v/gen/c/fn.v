@@ -50,6 +50,9 @@ fn (mut g Gen) is_used_by_main(node ast.FnDecl) bool {
 }
 
 fn (mut g Gen) fn_decl(node ast.FnDecl) {
+	$if trace_cgen_fn_decl ? {
+		eprintln('>   g.tid: ${g.tid} | g.fid: ${g.fid:3} | g.file.path: ${g.file.path} | fn_decl: ${node.name}')
+	}
 	if node.should_be_skipped {
 		return
 	}
@@ -167,6 +170,9 @@ fn (mut g Gen) fn_decl(node ast.FnDecl) {
 }
 
 fn (mut g Gen) gen_fn_decl(node &ast.FnDecl, skip bool) {
+	$if trace_cgen_gen_fn_decl ? {
+		eprintln('>   g.tid: ${g.tid} | g.fid: ${g.fid:3} | g.file.path: ${g.file.path} | gen_fn_decl: ${node.name} | skip: ${skip}')
+	}
 	// TODO: For some reason, build fails with autofree with this line
 	// as it's only informative, comment it for now
 	// g.gen_attrs(it.attrs)
@@ -791,9 +797,9 @@ fn (mut g Gen) fn_decl_params(params []ast.Param, scope &ast.Scope, is_variadic 
 			info := param_type_sym.info as ast.FnType
 			func := info.func
 			if !g.inside_c_extern {
-				g.write('${g.styp(func.return_type)} (*${caname})(')
+				g.write('${g.ret_styp(func.return_type)} (*${caname})(')
 			}
-			g.definitions.write_string('${g.styp(func.return_type)} (*${caname})(')
+			g.definitions.write_string('${g.ret_styp(func.return_type)} (*${caname})(')
 			g.fn_decl_params(func.params, unsafe { nil }, func.is_variadic, func.is_c_variadic)
 			if !g.inside_c_extern {
 				g.write(')')
@@ -2477,15 +2483,47 @@ fn (mut g Gen) call_args(node ast.CallExpr) {
 			}
 		} else if arg.expr is ast.ArrayDecompose {
 			mut d_count := 0
-			for d_i in i .. expected_types.len {
-				g.write('*(${g.styp(expected_types[d_i])}*)builtin__array_get(')
-				g.expr(arg.expr)
-				g.write(', ${d_count})')
-
-				if d_i < expected_types.len - 1 {
-					g.write(', ')
+			remaining_params := expected_types.len - i
+			if !arg.expr.expr_type.has_flag(.variadic) && remaining_params > 0 {
+				tmp_array := g.new_tmp_var()
+				line := g.go_before_last_stmt()
+				array_typ := g.styp(arg.expr.expr_type)
+				g.write('\t${array_typ} ${tmp_array} = ')
+				g.expr(arg.expr.expr)
+				g.writeln(';')
+				g.writeln('if (${tmp_array}.len < ${remaining_params}) {')
+				elem_word := if remaining_params == 1 { 'element is' } else { 'elements are' }
+				tmp_err_msg := g.new_tmp_var()
+				g.writeln('\tstring ${tmp_err_msg};')
+				g.writeln('\tif (${tmp_array}.len == 1) {')
+				g.writeln('\t\t${tmp_err_msg} = builtin__str_intp(2, _MOV((StrIntpData[]){')
+				g.writeln('\t\t\t{_S("array decompose: array has "), 0xfe07, {.d_i32 = ${tmp_array}.len}},')
+				g.writeln('\t\t\t{_S(" element but ${remaining_params} ${elem_word} needed"), 0, {.d_c = 0 }}}));')
+				g.writeln('\t} else {')
+				g.writeln('\t\t${tmp_err_msg} = builtin__str_intp(2, _MOV((StrIntpData[]){')
+				g.writeln('\t\t\t{_S("array decompose: array has "), 0xfe07, {.d_i32 = ${tmp_array}.len}},')
+				g.writeln('\t\t\t{_S(" elements but ${remaining_params} ${elem_word} needed"), 0, {.d_c = 0 }}}));')
+				g.writeln('\t}')
+				g.writeln('\tbuiltin___v_panic(${tmp_err_msg});')
+				g.writeln('}')
+				g.write(line.trim_left('\t'))
+				for d_i in i .. expected_types.len {
+					g.write('*(${g.styp(expected_types[d_i])}*)builtin__array_get(${tmp_array}, ${d_count})')
+					if d_i < expected_types.len - 1 {
+						g.write(', ')
+					}
+					d_count++
 				}
-				d_count++
+			} else {
+				for d_i in i .. expected_types.len {
+					g.write('*(${g.styp(expected_types[d_i])}*)builtin__array_get(')
+					g.expr(arg.expr)
+					g.write(', ${d_count})')
+					if d_i < expected_types.len - 1 {
+						g.write(', ')
+					}
+					d_count++
+				}
 			}
 			already_decomposed = true
 			continue
@@ -2594,7 +2632,7 @@ fn (mut g Gen) call_args(node ast.CallExpr) {
 			}
 		} else {
 			if variadic_count > 0 {
-				if g.pref.translated || g.file.is_translated {
+				if node.is_c_variadic {
 					// Handle passing e.g. C string literals to `...` C varargs:
 					// void DEH_snprintf(char *buffer, size_t len, const char *fmt, ...)
 					// deh_snprintf(buffer, 9, c'STCFN%.3d', j++)
@@ -2606,7 +2644,7 @@ fn (mut g Gen) call_args(node ast.CallExpr) {
 					}
 				} else {
 					// passing variadic arg to another call which expects same array type
-					if args.len == 1
+					if variadic_count == 1
 						&& ((args[arg_nr].typ.has_flag(.variadic) && args[arg_nr].typ == varg_type)
 						|| (varg_type.has_flag(.variadic)
 						&& args[arg_nr].typ == varg_type.clear_flag(.variadic))) {

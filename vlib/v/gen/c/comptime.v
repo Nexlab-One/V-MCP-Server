@@ -423,7 +423,10 @@ fn (mut g Gen) comptime_if(node ast.IfExpr) {
 		// The first part represents the current context of the branch statement, `comptime_branch_context_str`, formatted like `T=int,X=string,method.name=json`
 		// The second part is the branch's id.
 		// This format must match what is in `checker`.
-		idx_str := comptime_branch_context_str + '|id=${branch.id}|'
+		mut idx_str := comptime_branch_context_str + '|id=${branch.id}|'
+		if g.comptime.inside_comptime_for && g.comptime.comptime_for_field_var != '' {
+			idx_str += '|field_type=${g.comptime.comptime_for_field_type}|'
+		}
 		if comptime_is_true := g.table.comptime_is_true[idx_str] {
 			// `g.table.comptime_is_true` are the branch condition results set by `checker`
 			is_true = comptime_is_true
@@ -492,13 +495,16 @@ fn (mut g Gen) comptime_if(node ast.IfExpr) {
 						g.writeln('builtin___result_ok(&(${base_styp}[]) { ${tmp_var2} }, (_result*)(&${tmp_var}), sizeof(${base_styp}));')
 						g.writeln('}')
 					} else if is_array_fixed {
+						tmp_var2 := g.new_tmp_var()
 						base_styp := g.base_type(node.typ)
-						g.write('memcpy(&${tmp_var}, (${base_styp})')
+						g.write('{ ${base_styp} ${tmp_var2} = ')
 						g.stmt(last)
 						if g.out.last_n(2).contains(';') {
 							g.go_back(2)
 						}
-						g.write(', sizeof(${base_styp}))')
+						g.writeln(';')
+						g.writeln2('memcpy(&${tmp_var}, &${tmp_var2}, sizeof(${base_styp}));',
+							'}')
 					} else {
 						g.write('${tmp_var} = ')
 						g.stmt(last)
@@ -1010,7 +1016,10 @@ fn (mut g Gen) comptime_match(node ast.MatchExpr) {
 		// The first part represents the current context of the branch statement, `comptime_branch_context_str`, formatted like `T=int,X=string,method.name=json`
 		// The second part is the branch's id.
 		// This format must match what is in `checker`.
-		idx_str := comptime_branch_context_str + '|id=${branch.id}|'
+		mut idx_str := comptime_branch_context_str + '|id=${branch.id}|'
+		if g.comptime.inside_comptime_for && g.comptime.comptime_for_field_var != '' {
+			idx_str += '|field_type=${g.comptime.comptime_for_field_type}|'
+		}
 		if comptime_is_true := g.table.comptime_is_true[idx_str] {
 			// `g.table.comptime_is_true` are the branch condition results set by `checker`
 			is_true = comptime_is_true

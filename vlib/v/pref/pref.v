@@ -203,8 +203,9 @@ pub mut:
 	line_info        string // `-line-info="file.v:28"`: for "mini VLS" (shows information about objects on provided line)
 	linfo            LineInfo
 
-	run_only []string // VTEST_ONLY_FN and -run-only accept comma separated glob patterns.
-	exclude  []string // glob patterns for excluding .v files from the list of .v files that otherwise would have been used for a compilation, example: `-exclude @vlib/math/*.c.v`
+	run_only  []string // VTEST_ONLY_FN and -run-only accept comma separated glob patterns.
+	exclude   []string // glob patterns for excluding .v files from the list of .v files that otherwise would have been used for a compilation, example: `-exclude @vlib/math/*.c.v`
+	file_list []string // A list of .v files or directories. All .v files found recursively in directories will be included in the compilation.
 	// Only test_ functions that match these patterns will be run. -run-only is valid only for _test.v files.
 	// -d vfmt and -d another=0 for `$if vfmt { will execute }` and `$if another ? { will NOT get here }`
 	compile_defines     []string          // just ['vfmt']
@@ -226,7 +227,7 @@ pub mut:
 	fatal_errors     bool // unconditionally exit after the first error with exit(1)
 	reuse_tmpc       bool // do not use random names for .tmp.c and .tmp.c.rsp files, and do not remove them
 	no_rsp           bool // when true, pass C backend options directly on the CLI (do not use `.rsp` files for them, some older C compilers do not support them)
-	no_std           bool // when true, do not pass -std=gnu99(linux)/-std=c99 to the C backend
+	no_std           bool // when true, do not pass -std=c99 to the C backend
 
 	no_parallel       bool // do not use threads when compiling; slower, but more portable and sometimes less buggy
 	parallel_cc       bool // whether to split the resulting .c file into many .c files + a common .h file, that are then compiled in parallel, then linked together.
@@ -257,9 +258,10 @@ pub mut:
 	// forwards compatibility settings:
 	relaxed_gcc14 bool = true // turn on the generated pragmas, that make gcc versions > 14 a lot less pedantic. The default is to have those pragmas in the generated C output, so that gcc-14 can be used on Arch etc.
 	//
-	subsystem   Subsystem // the type of the window app, that is going to be generated; has no effect on !windows
-	is_vls      bool
-	json_errors bool // -json-errors, for VLS and other tools
+	subsystem     Subsystem // the type of the window app, that is going to be generated; has no effect on !windows
+	is_vls        bool
+	json_errors   bool // -json-errors, for VLS and other tools
+	new_transform bool // temporary for the new transformer
 }
 
 pub fn parse_args(known_external_commands []string, args []string) (&Preferences, string) {
@@ -331,12 +333,8 @@ pub fn parse_args_and_show_errors(known_external_commands []string, args []strin
 	if coverage_dir_from_env != '' {
 		res.coverage_dir = coverage_dir_from_env
 	}
-	/* $if macos || linux {
-		res.use_cache = true
-		res.skip_unused = true
-	} */
-	mut no_skip_unused := false
 
+	mut no_skip_unused := false
 	mut command, mut command_idx := '', 0
 	for i := 0; i < args.len; i++ {
 		arg := args[i]
@@ -739,6 +737,10 @@ pub fn parse_args_and_show_errors(known_external_commands []string, args []strin
 				res.exclude << patterns
 				i++
 			}
+			'-file-list' {
+				res.file_list = cmdline.option(args[i..], arg, '').split_any(',')
+				i++
+			}
 			'-test-runner' {
 				res.test_runner = cmdline.option(args[i..], arg, res.test_runner)
 				i++
@@ -762,8 +764,13 @@ pub fn parse_args_and_show_errors(known_external_commands []string, args []strin
 			'-experimental' {
 				res.experimental = true
 			}
+			'-new-transformer' {
+				res.new_transform = true
+			}
 			'-usecache' {
 				res.use_cache = true
+				res.parallel_cc = false
+				res.no_parallel = true
 			}
 			'-use-os-system-to-run' {
 				res.use_os_system_to_run = true
@@ -986,13 +993,11 @@ pub fn parse_args_and_show_errors(known_external_commands []string, args []strin
 					vexe := vexe_path()
 					vroot := os.dir(vexe)
 					so_path := os.join_path(vroot, 'thirdparty', 'photon', 'photonwrapper.so')
-					so_url := 'https://github.com/vlang/photonbin/raw/master/photonwrapper_${os.user_os()}_${arch}.so'
+					so_url := 'https://raw.githubusercontent.com/vlang/photonbin/master/photonwrapper_${os.user_os()}_${arch}.so'
 					if !os.exists(so_path) {
 						println('coroutines .so not found, downloading...')
-						os.execute_opt('wget -O "${so_path}" "${so_url}"') or {
-							os.execute_opt('curl -o "${so_path}" "${so_url}"') or {
-								panic('coroutines .so could not be downloaded with wget or curl. Download ${so_url}, place it in ${so_path} then try again.')
-							}
+						os.execute_opt('${os.quoted_path(vexe)} download -o "${so_path}" "${so_url}"') or {
+							panic('coroutines .so could not be downloaded with `v download`. Download ${so_url}, place it in ${so_path} then try again.')
 						}
 						println('done!')
 					}
@@ -1157,6 +1162,8 @@ pub fn parse_args_and_show_errors(known_external_commands []string, args []strin
 	}
 	if command == 'build-module' {
 		res.build_mode = .build_module
+		res.no_parallel = true
+		res.parallel_cc = false
 		res.path = command_args[0] or { eprintln_exit('v build-module: no module specified') }
 	}
 	if res.ccompiler == 'musl-gcc' {

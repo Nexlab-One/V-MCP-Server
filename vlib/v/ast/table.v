@@ -2219,6 +2219,21 @@ pub fn (mut t Table) unwrap_generic_type_ex(typ Type, generic_names []string, co
 							}
 						}
 					}
+					if fields[i].has_default_expr {
+						if fields[i].default_expr_typ.has_flag(.generic) {
+							if t_typ := t.convert_generic_type(fields[i].default_expr_typ,
+								t_generic_names, t_concrete_types)
+							{
+								fields[i].default_expr_typ = t_typ
+							}
+						} else if fields[i].default_expr_typ == 0
+							|| fields[i].default_expr_typ == nil_type {
+							if fields[i].default_expr.is_nil()
+								&& fields[i].typ.is_any_kind_of_pointer() {
+								fields[i].default_expr_typ = fields[i].typ
+							}
+						}
+					}
 				}
 				// update concrete types
 				for i in 0 .. ts.info.generic_types.len {
@@ -2836,4 +2851,9 @@ pub fn (mut t Table) get_veb_result_type_idx() int {
 @[inline]
 pub fn (mut t Table) register_vls_info(key string, val VlsInfo) {
 	t.vls_info[key] = val
+}
+
+pub fn (t &Table) unwrap(typ Type) Type {
+	ts := t.sym(typ)
+	return if ts.info is Alias { t.unwrap(ts.info.parent_type) } else { typ }
 }
