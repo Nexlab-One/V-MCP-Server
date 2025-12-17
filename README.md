@@ -98,6 +98,60 @@ Add this to your `.cursor/mcp.json` file:
 
 Replace `/path/to/v-mcp` with the actual path to your V MCP directory.
 
+### Usage
+
+Once configured, you can ask questions like:
+
+- "How do I work with arrays in V?"
+- "Show me V struct examples"
+- "What modules are in V's standard library?"
+- "Explain V error handling"
+
+## Performance Features
+
+- Smart caching for frequently accessed content
+- Relevance scoring for better search results
+- Graceful degradation when parts of V repository are missing
+- Configurable performance limits
+
+## Troubleshooting
+
+### Server Not Starting?
+```bash
+# Check Python version
+python --version  # Should be 3.10+
+
+# Verify dependencies
+cd v-mcp-server
+python -m pip install -r requirements.txt
+
+# Test server
+python main.py
+```
+
+### Missing Documentation?
+- Ensure you're in the V repository root
+- Check that `doc/`, `examples/`, and `vlib/` directories exist
+- Set `V_REPO_PATH` if running from different location
+
+### Slow Performance?
+- Increase cache TTL: `export V_CACHE_TTL_SECONDS=600`
+- Clear cache: Use `clear_v_cache()` tool
+- Restart server to refresh all content
+
+## Next Steps
+
+Once configured, you can start using the V MCP server immediately. Try asking questions like:
+
+- "What are the basic data types in V?"
+- "Show me how to create a struct"
+- "How do I handle errors in V?"
+- "What functions are available in the os module?"
+
+For detailed documentation and advanced configuration options, see [v-mcp-server/README.md](v-mcp-server/README.md).
+
+---
+
 ## V Language Installation
 
 ### Docker
@@ -325,56 +379,3 @@ you can install it, by doing the following:
 </a>
 
 https://github.com/vlang/ui
-
-
-### Usage
-
-Once configured, you can ask questions like:
-
-- "How do I work with arrays in V?"
-- "Show me V struct examples"
-- "What modules are in V's standard library?"
-- "Explain V error handling"
-
-## Performance Features
-
-- Smart caching for frequently accessed content
-- Relevance scoring for better search results
-- Graceful degradation when parts of V repository are missing
-- Configurable performance limits
-
-## Troubleshooting
-
-### Server Not Starting?
-```bash
-# Check Python version
-python --version  # Should be 3.10+
-
-# Verify dependencies
-cd v-mcp-server
-python -m pip install -r requirements.txt
-
-# Test server
-python main.py
-```
-
-### Missing Documentation?
-- Ensure you're in the V repository root
-- Check that `doc/`, `examples/`, and `vlib/` directories exist
-- Set `V_REPO_PATH` if running from different location
-
-### Slow Performance?
-- Increase cache TTL: `export V_CACHE_TTL_SECONDS=600`
-- Clear cache: Use `clear_v_cache()` tool
-- Restart server to refresh all content
-
-## Next Steps
-
-Once configured, you can start using the V MCP server immediately. Try asking questions like:
-
-- "What are the basic data types in V?"
-- "Show me how to create a struct"
-- "How do I handle errors in V?"
-- "What functions are available in the os module?"
-
-For detailed documentation and advanced configuration options, see [v-mcp-server/README.md](v-mcp-server/README.md).
