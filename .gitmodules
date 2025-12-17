@@ -1,3 +1,6 @@
 [submodule "v-ui"]
 	path = v-ui
 	url = https://github.com/vlang/ui.git
+[submodule "v-v-mcp"]
+	path = v-v-mcp
+	url = https://github.com/Nexlab-One/v-v-mcp.git

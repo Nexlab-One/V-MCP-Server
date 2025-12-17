@@ -7,7 +7,8 @@ A Model Context Protocol (MCP) server that provides comprehensive V programming 
 This MCP server enhances V development by providing:
 
 - Instant access to V documentation without leaving your editor
-- 300+ code examples for common patterns and use cases
+- 300+ V language code examples for common patterns and use cases
+- 80+ V UI examples for building cross-platform applications
 - Smart search through documentation and examples
 - Fast responses through intelligent caching
 - Clear error messages and troubleshooting guidance
@@ -28,6 +29,14 @@ The server is designed to improve the V development workflow:
 - Python 3.10+
 - V repository (you're already here!)
 - V UI submodule (automatically included)
+
+### Initial Setup (First Time)
+
+If you just cloned this repository, initialize the submodules:
+
+```bash
+git submodule update --init --recursive
+```
 
 ### Install Dependencies
 ```bash
@@ -76,6 +85,8 @@ Customize the server with environment variables:
 export V_CACHE_TTL_SECONDS=300      # Cache lifetime (default: 300s)
 export V_MAX_SEARCH_RESULTS=50      # Max search results (default: 50)
 export V_LOG_LEVEL=INFO             # Logging level (default: INFO)
+export V_REPO_PATH=/path/to/v-mcp  # V repository path (default: parent directory)
+export V_UI_PATH=/path/to/v-ui     # V UI repository path (default: v-ui submodule)
 ```
 
 ## Cursor IDE Integration
@@ -139,6 +150,12 @@ python main.py
 - Ensure you're in the V repository root
 - Check that `doc/`, `examples/`, and `vlib/` directories exist
 - Set `V_REPO_PATH` if running from different location
+- Initialize submodules: `git submodule update --init --recursive`
+
+### V UI Examples Not Available?
+- Ensure the V UI submodule is initialized: `git submodule update --init --recursive`
+- Check that `v-ui/examples/` directory exists
+- Set `V_UI_PATH` environment variable if V UI is in a different location
 
 ### Slow Performance?
 - Increase cache TTL: `export V_CACHE_TTL_SECONDS=600`
@@ -155,6 +172,8 @@ Once configured, you can start using the V MCP server immediately. Try asking qu
 - "What functions are available in the os module?"
 
 For detailed documentation and advanced configuration options, see [v-mcp-server/README.md](v-mcp-server/README.md).
+
+For instructions on updating the V language and V UI repositories, see [UPDATE_REPOS.md](UPDATE_REPOS.md).
 
 ---
 
