@@ -17,7 +17,7 @@ fn (mut g Gen) dump_expr(node ast.DumpExpr) {
 
 	if node.expr is ast.CallExpr {
 		g.inside_dump_fn = true
-		defer {
+		defer(fn) {
 			g.inside_dump_fn = false
 		}
 	}
@@ -42,7 +42,21 @@ fn (mut g Gen) dump_expr(node ast.DumpExpr) {
 			}
 		}
 	} else if node.expr is ast.Ident && node.expr.ct_expr {
-		expr_type = g.type_resolver.get_type(node.expr)
+		for {
+			if node.expr.obj is ast.Var {
+				if node.expr.obj.ct_type_var == .field_var && g.comptime.inside_comptime_for
+					&& g.comptime.comptime_for_field_var != '' {
+					expr_type = if node.expr.obj.ct_type_unwrapped || node.expr.obj.is_unwrapped {
+						g.comptime.comptime_for_field_type.clear_flag(.option)
+					} else {
+						g.comptime.comptime_for_field_type
+					}
+					break
+				}
+			}
+			expr_type = g.type_resolver.get_type(node.expr)
+			break
+		}
 		name = g.styp(g.unwrap_generic(expr_type.clear_flags(.shared_f, .result))).replace('*',
 			'')
 	} else if node.expr is ast.SelectorExpr && node.expr.expr is ast.Ident
@@ -83,7 +97,25 @@ fn (mut g Gen) dump_expr(node ast.DumpExpr) {
 		if expr_type.has_flag(.option_mut_param_t) {
 			g.write('*')
 		}
-		g.expr(node.expr)
+		for {
+			if node.expr is ast.Ident {
+				if node.expr.obj is ast.Var {
+					if node.expr.obj.ct_type_var == .field_var && g.comptime.inside_comptime_for
+						&& (node.expr.obj.ct_type_unwrapped || node.expr.obj.is_unwrapped) {
+						field_type := g.comptime.comptime_for_field_type
+						if field_type.has_flag(.option) {
+							styp := g.base_type(field_type.clear_flag(.option))
+							is_auto_heap := node.expr.is_auto_heap()
+							ptr := if is_auto_heap { '->' } else { '.' }
+							g.write('(*(${styp}*)${c_name(node.expr.name)}${ptr}data)')
+							break
+						}
+					}
+				}
+			}
+			g.expr(node.expr)
+			break
+		}
 		g.inside_opt_or_res = old_inside_opt_or_res
 	}
 	g.write(')')
@@ -177,22 +209,23 @@ fn (mut g Gen) dump_expr_definitions() {
 		}
 		dump_already_generated_fns[dump_fn_name] = true
 
-		dump_fn_defs.writeln('${str_dumparg_ret_type} ${dump_fn_name}(string fpath, int line, string sexpr, ${str_dumparg_type} dump_arg);')
-		if g.writeln_fn_header('${str_dumparg_ret_type} ${dump_fn_name}(string fpath, int line, string sexpr, ${str_dumparg_type} dump_arg)', mut
+		dump_fn_defs.writeln('${str_dumparg_ret_type} ${dump_fn_name}(string fpath, ${ast.int_type_name} line, string sexpr, ${str_dumparg_type} dump_arg);')
+		if g.writeln_fn_header('${str_dumparg_ret_type} ${dump_fn_name}(string fpath, ${ast.int_type_name} line, string sexpr, ${str_dumparg_type} dump_arg)', mut
 			dump_fns)
 		{
 			continue
 		}
 		mut surrounder := util.new_surrounder(3)
-		surrounder.add('\tstring sline = int_str(line);', '\tstring_free(&sline);')
+		int_str := g.get_str_fn(ast.int_type)
+		surrounder.add('\tstring sline = ${int_str}(line);', '\tbuiltin__string_free(&sline);')
 		if dump_sym.kind == .function && !is_option {
-			surrounder.add('\tstring value = ${to_string_fn_name}();', '\tstring_free(&value);')
+			surrounder.add('\tstring value = ${to_string_fn_name}();', '\tbuiltin__string_free(&value);')
 		} else if dump_sym.kind == .none {
-			surrounder.add('\tstring value = _S("none");', '\tstring_free(&value);')
+			surrounder.add('\tstring value = _S("none");', '\tbuiltin__string_free(&value);')
 		} else if is_ptr {
 			if typ.has_flag(.option) {
-				surrounder.add('\tstring value = isnil(&dump_arg.data) ? _S("nil") : ${to_string_fn_name}(${deref}dump_arg);',
-					'\tstring_free(&value);')
+				surrounder.add('\tstring value = builtin__isnil(&dump_arg.data) ? _S("nil") : ${to_string_fn_name}(${deref}dump_arg);',
+					'\tbuiltin__string_free(&value);')
 			} else {
 				prefix := if dump_sym.is_c_struct() {
 					c_struct_ptr(dump_sym, typ, str_method_expects_ptr)
@@ -200,7 +233,7 @@ fn (mut g Gen) dump_expr_definitions() {
 					deref
 				}
 				surrounder.add('\tstring value = (dump_arg == NULL) ? _S("nil") : ${to_string_fn_name}(${prefix}dump_arg);',
-					'\tstring_free(&value);')
+					'\tbuiltin__string_free(&value);')
 			}
 		} else {
 			prefix := if dump_sym.is_c_struct() {
@@ -209,15 +242,15 @@ fn (mut g Gen) dump_expr_definitions() {
 				deref
 			}
 			surrounder.add('\tstring value = ${to_string_fn_name}(${prefix}dump_arg);',
-				'\tstring_free(&value);')
+				'\tbuiltin__string_free(&value);')
 		}
 		surrounder.add('
 	strings__Builder sb = strings__new_builder(64);
 ', '
 	string res;
 	res = strings__Builder_str(&sb);
-	eprint(res);
-	string_free(&res);
+	builtin__eprint(res);
+	builtin__string_free(&res);
 	strings__Builder_free(&sb);
 ')
 		surrounder.builder_write_befores(mut dump_fns)
@@ -238,23 +271,18 @@ fn (mut g Gen) dump_expr_definitions() {
 		dump_fns.writeln('\tstrings__Builder_write_string(&sb, value);')
 		dump_fns.writeln("\tstrings__Builder_write_rune(&sb, '\\n');")
 		surrounder.builder_write_afters(mut dump_fns)
-		if is_fixed_arr_ret {
+		if is_fixed_arr_ret && !is_ptr {
 			tmp_var := g.new_tmp_var()
 			init_str := if dump_sym.is_empty_struct_array() {
 				'{E_STRUCT}'
 			} else {
 				'{0}'
 			}
-			if typ.is_ptr() {
-				dump_fns.writeln('\t${str_dumparg_ret_type} ${tmp_var} = HEAP(${g.styp(typ.set_nr_muls(0))}, ${init_str});')
-				dump_fns.writeln('\tmemcpy(${tmp_var}->ret_arr, dump_arg, sizeof(${str_dumparg_type}));')
-			} else {
-				dump_fns.writeln('\t${str_dumparg_ret_type} ${tmp_var} = ${init_str};')
-				dump_fns.writeln('\tmemcpy(${tmp_var}.ret_arr, dump_arg, sizeof(${str_dumparg_type}));')
-			}
+			dump_fns.writeln('\t${str_dumparg_ret_type} ${tmp_var} = ${init_str};')
+			dump_fns.writeln('\tmemcpy(${tmp_var}.ret_arr, dump_arg, sizeof(${str_dumparg_type}));')
 			dump_fns.writeln('\treturn ${tmp_var};')
 		} else {
-			dump_fns.writeln('\treturn dump_arg;')
+			dump_fns.writeln('\treturn dump_arg; /* ${str_dumparg_type} */')
 		}
 		dump_fns.writeln('}')
 	}

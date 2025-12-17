@@ -4,6 +4,10 @@ import os
 import term
 import time
 
+type FnCheck = fn () !
+
+type OneOrManyStrings = string | []string
+
 const vexe_path = os.getenv('VEXE')
 
 const vroot = os.dir(vexe_path)
@@ -23,19 +27,18 @@ const l2w_crosscc = os.find_abs_path_of_executable('x86_64-w64-mingw32-gcc-win32
 const clang_path = os.find_abs_path_of_executable('clang') or { '' }
 
 fn main() {
+	unbuffer_stdout()
 	mut commands := get_all_commands()
 	// summary
 	sw := time.new_stopwatch()
 	for mut cmd in commands {
-		cmd.run()
+		cmd.run()?
 	}
 	spent := sw.elapsed().milliseconds()
 	oks := commands.filter(it.ecode == 0)
 	fails := commands.filter(it.ecode != 0)
-	flush_stdout()
 	println('')
 	println(term.header_left(term_highlight('Summary of `v test-all`:'), '-'))
-	println(term_highlight('Total runtime: ${spent} ms'))
 	for ocmd in oks {
 		msg := if ocmd.okmsg != '' { ocmd.okmsg } else { ocmd.line }
 		println(term.colorize(term.green, '>          OK: ${msg} '))
@@ -44,7 +47,7 @@ fn main() {
 		msg := if fcmd.errmsg != '' { fcmd.errmsg } else { fcmd.line }
 		println(term.failed('>      Failed:') + ' ${msg}')
 	}
-	flush_stdout()
+	println(term_highlight('Total runtime: ${spent} ms'))
 	if fails.len > 0 {
 		exit(1)
 	}
@@ -55,16 +58,6 @@ enum RunCommandKind {
 	execute
 }
 
-const expect_nothing = '<nothing>'
-
-const starts_with_nothing = '<nothing>'
-
-const ends_with_nothing = '<nothing>'
-
-const contains_nothing = '<nothing>'
-
-type FnCheck = fn () !
-
 struct Command {
 mut:
 	line        string
@@ -72,12 +65,12 @@ mut:
 	ecode       int
 	okmsg       string
 	errmsg      string
-	rmfile      string
+	rmfile      ?OneOrManyStrings
 	runcmd      RunCommandKind = .system
-	expect      string         = expect_nothing
-	starts_with string         = starts_with_nothing
-	ends_with   string         = ends_with_nothing
-	contains    string         = contains_nothing
+	expect      ?string
+	starts_with ?string
+	ends_with   ?string
+	contains    ?string
 	output      string
 	before_cb   FnCheck = unsafe { nil }
 	after_cb    FnCheck = unsafe { nil }
@@ -88,6 +81,11 @@ fn get_all_commands() []Command {
 	res << Command{
 		line:   '${vexe} examples/hello_world.v'
 		okmsg:  'V can compile hello world.'
+		rmfile: 'examples/hello_world'
+	}
+	res << Command{
+		line:   '${vexe} -W -Wimpure-v examples/hello_world.v'
+		okmsg:  'V can compile hello world with the stricter `-W -Wimpure-v` mode .'
 		rmfile: 'examples/hello_world'
 	}
 	$if linux {
@@ -107,17 +105,12 @@ fn get_all_commands() []Command {
 		rmfile: 'hhww.c'
 	}
 	res << Command{
-		line:   '${vexe} -skip-unused examples/hello_world.v'
-		okmsg:  'V can compile hello world with -skip-unused.'
-		rmfile: 'examples/hello_world'
+		line:  '${vexe} test vlib/builtin'
+		okmsg: 'V can test vlib/builtin'
 	}
 	res << Command{
-		line:  '${vexe} -skip-unused test vlib/builtin'
-		okmsg: 'V can test vlib/builtin with -skip-unused'
-	}
-	res << Command{
-		line:   '${vexe} -skip-unused -profile - examples/hello_world.v'
-		okmsg:  'V can compile hello world with both -skip-unused and -profile .'
+		line:   '${vexe} -profile - examples/hello_world.v'
+		okmsg:  'V can compile hello world with -profile .'
 		rmfile: 'examples/hello_world'
 	}
 	res << Command{
@@ -223,18 +216,18 @@ fn get_all_commands() []Command {
 		res << Command{
 			line:   '${vexe} -os linux -experimental -b native -o hw.linux examples/hello_world.v'
 			okmsg:  'V compiles hello_world.v on the native backend for linux'
-			rmfile: 'hw.linux'
+			rmfile: ['hw.linux', 'hw.linux.o']
 		}
 		res << Command{
 			line:   '${vexe} -os macos -experimental -b native -o hw.macos examples/hello_world.v'
 			okmsg:  'V compiles hello_world.v on the native backend for macos'
-			rmfile: 'hw.macos'
+			rmfile: ['hw.macos', 'hw.macos.o']
 		}
 		$if windows {
 			res << Command{
 				line:   '${vexe} -os windows -experimental -b native -o hw.exe examples/hello_world.v'
 				okmsg:  'V compiles hello_world.v on the native backend for windows'
-				rmfile: 'hw.exe'
+				rmfile: ['hw.exe', 'hw.o']
 			}
 		}
 		//
@@ -244,13 +237,8 @@ fn get_all_commands() []Command {
 			rmfile: 'hw.js'
 		}
 		res << Command{
-			line:   '${vexe} -skip-unused -b js -o hw_skip_unused.js examples/hello_world.v'
-			okmsg:  'V compiles hello_world.v on the JS backend, with -skip-unused'
-			rmfile: 'hw_skip_unused.js'
-		}
-		res << Command{
-			line:   '${vexe} -skip-unused examples/2048'
-			okmsg:  'V can compile 2048 with -skip-unused.'
+			line:   '${vexe} examples/2048'
+			okmsg:  'V can compile 2048.'
 			rmfile: 'examples/2048/2048'
 		}
 		if _ := os.find_abs_path_of_executable('emcc') {
@@ -263,8 +251,8 @@ fn get_all_commands() []Command {
 			println('> emcc not found, skipping `v -os wasm32_emscripten examples/2048`.')
 		}
 		res << Command{
-			line:   '${vexe} -skip-unused  -live examples/hot_reload/bounce.v'
-			okmsg:  'V can compile the hot code reloading bounce.v example with both: -skip-unused -live'
+			line:   '${vexe} -live examples/hot_reload/bounce.v'
+			okmsg:  'V can compile the hot code reloading bounce.v example with -live'
 			rmfile: 'examples/hot_reload/bounce'
 		}
 	}
@@ -289,9 +277,9 @@ fn get_all_commands() []Command {
 		rmfile: 'vtmp_prealloc'
 	}
 	res << Command{
-		line:   '${vexe} -o vtmp_unused -skip-unused cmd/v'
-		okmsg:  'V can compile itself with -skip-unused.'
-		rmfile: 'vtmp_unused'
+		line:   '${vexe} -o vtmp_ntransformer -new-transformer cmd/v'
+		okmsg:  'V can compile itself with -new-transformer.'
+		rmfile: 'vtmp_ntransformer'
 	}
 	$if linux {
 		res << Command{
@@ -413,6 +401,11 @@ fn get_all_commands() []Command {
 			okmsg:  'A simple veb app, compiles with `-gc none -no-retry-compilation -cc tcc -d use_openssl` on macos and linux'
 			rmfile: 'examples/veb/todo/main'
 		}
+		res << Command{
+			line:   '${vexe} -d trace_before_request examples/veb/veb_example.v'
+			okmsg:  'examples/veb/veb_example.v compiles with `-d trace_before_request` on macos and linux'
+			rmfile: 'examples/veb/veb_example'
+		}
 	}
 	$if linux {
 		res << Command{
@@ -442,7 +435,7 @@ fn get_all_commands() []Command {
 	return res
 }
 
-fn (mut cmd Command) run() {
+fn (mut cmd Command) run() ? {
 	// Changing the current directory is needed for some of the compiler tests,
 	// vlib/v/tests/local_test.v and vlib/v/tests/repl/repl_test.v
 	os.chdir(vroot) or {}
@@ -485,25 +478,25 @@ fn (mut cmd Command) run() {
 	if cmd.ecode != 0 {
 		is_failed = true
 	}
-	if cmd.expect != expect_nothing {
+	if cmd.expect != none {
 		if cmd.output != cmd.expect {
 			is_failed = true
 			is_failed_expected = true
 		}
 	}
-	if cmd.starts_with != starts_with_nothing {
+	if cmd.starts_with != none {
 		if !cmd.output.starts_with(cmd.starts_with) {
 			is_failed = true
 			is_failed_starts_with = true
 		}
 	}
-	if cmd.ends_with != ends_with_nothing {
+	if cmd.ends_with != none {
 		if !cmd.output.ends_with(cmd.ends_with) {
 			is_failed = true
 			is_failed_ends_with = true
 		}
 	}
-	if cmd.contains != contains_nothing {
+	if cmd.contains != none {
 		if !cmd.output.contains(cmd.contains) {
 			is_failed = true
 			is_failed_contains = true
@@ -518,25 +511,22 @@ fn (mut cmd Command) run() {
 		eprintln('>   output:\n${cmd.output}')
 	}
 	if is_failed && is_failed_starts_with {
-		eprintln('> expected to start with:\n${cmd.starts_with}')
-		eprintln('>                 output:\n${cmd.output#[..cmd.starts_with.len]}')
+		eprintln('> expected to start with:\n${cmd.starts_with?}')
+		eprintln('>                 output:\n${cmd.output#[..cmd.starts_with?.len]}')
 	}
 	if is_failed && is_failed_ends_with {
-		eprintln('> expected to end with:\n${cmd.ends_with}')
-		eprintln('>               output:\n${cmd.output#[-cmd.starts_with.len..]}')
+		eprintln('> expected to end with:\n${cmd.ends_with?}')
+		eprintln('>               output:\n${cmd.output#[-cmd.starts_with?.len..]}')
 	}
 	if is_failed && is_failed_contains {
-		eprintln('> expected to contain:\n${cmd.contains}')
+		eprintln('> expected to contain:\n${cmd.contains?}')
 		eprintln('>              output:\n${cmd.output}')
 	}
 	if vtest_nocleanup {
 		return
 	}
-	if cmd.rmfile != '' {
+	if cmd.rmfile != none {
 		mut file_existed := rm_existing(cmd.rmfile)
-		if os.user_os() == 'windows' {
-			file_existed = file_existed || rm_existing(cmd.rmfile + '.exe')
-		}
 		if !file_existed {
 			eprintln('Expected file did not exist: ${cmd.rmfile}')
 			cmd.ecode = 999
@@ -544,10 +534,33 @@ fn (mut cmd Command) run() {
 	}
 }
 
+fn rm_existing(paths OneOrManyStrings) bool {
+	match paths {
+		string {
+			return rm_existing_file(paths)
+		}
+		[]string {
+			mut existing := false
+			for path in paths {
+				existing ||= rm_existing_file(path)
+			}
+			return existing
+		}
+	}
+	return false
+}
+
 // try to remove a file, return if it existed before the removal attempt
-fn rm_existing(path string) bool {
-	existed := os.exists(path)
+fn rm_existing_file(path string) bool {
+	mut existed := os.exists(path)
 	os.rm(path) or {}
+
+	win_path := path + '.exe'
+	if os.exists(win_path) {
+		existed = true
+		os.rm(win_path) or {}
+	}
+
 	return existed
 }
 

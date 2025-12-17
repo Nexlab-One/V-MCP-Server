@@ -131,6 +131,11 @@ pub fn (mut b Builder) middle_stages() ! {
 
 	b.checker.check_files(b.parsed_files)
 	util.timing_measure('CHECK')
+	$if trace_type_symbols_after_checker ? {
+		for t, s in b.table.type_symbols {
+			println('> t: ${t:10} | s.mod: ${s.mod:-40} | s.name: ${'${s.name#[..30]}':-30} | s.is_builtin: ${s.is_builtin:6} | s.is_pub: ${s.is_pub}')
+		}
+	}
 	if b.pref.dump_defines != '' {
 		b.dump_defines()
 	}
@@ -329,10 +334,7 @@ pub fn (b &Builder) import_graph() &depgraph.DepGraph {
 			if b.pref.backend == .c {
 				// TODO: JavaScript backend doesn't handle os for now
 				// os import libraries so we exclude anything which could cause a loop
-				// git grep import vlib/os | cut -f2 -d: | cut -f2 -d" " | sort -u
-				// dl, os, os.cmdline, os.filelock, os.notify, strings, strings.textscanner, term.termios, time
-				if b.pref.is_vsh
-					&& p.mod.name !in ['os', 'dl', 'strings.textscanner', 'term.termios'] {
+				if p.path.ends_with('.vsh') {
 					deps << 'os'
 				}
 			}
@@ -477,14 +479,14 @@ pub fn (b &Builder) show_total_warns_and_errors_stats() {
 		}
 	}
 	if !b.pref.is_vls && b.checker.nr_errors > 0 && b.pref.path.ends_with('.v')
-		&& os.is_file(b.pref.path) {
+		&& os.is_file(b.pref.path) && !b.pref.path.ends_with('vrepl_temp.v') {
 		if b.checker.errors.any(it.message.starts_with('unknown ')) {
 			// Sometimes users try to `v main.v`, when they have several .v files in their project.
 			// Then, they encounter puzzling errors about missing or unknown types. In this case,
 			// the intended command may have been `v .` instead, so just suggest that:
 			old_cmd := util.bold('v ${b.pref.path}')
 			new_cmd := util.bold('v ${os.dir(b.pref.path)}')
-			eprintln(util.color('notice', 'If the code of your project is in multiple files, try with `${new_cmd}` instead of `${old_cmd}`'))
+			eprintln(util.color('notice', 'If the code of your project is in a folder with multiple .v files, try `${new_cmd}` instead of `${old_cmd}`'))
 		}
 	}
 }
@@ -533,7 +535,7 @@ pub fn (mut b Builder) print_warnings_and_errors() {
 				if b.pref.json_errors {
 					json_errors << util.JsonError{
 						message: err.message
-						path:    err.file_path
+						path:    os.to_slash(err.file_path)
 						line_nr: err.pos.line_nr + 1
 						col:     err.pos.col + 1
 					}
@@ -544,10 +546,11 @@ pub fn (mut b Builder) print_warnings_and_errors() {
 			}
 		}
 		if b.pref.json_errors {
-			util.print_json_errors(json_errors)
+			if !b.pref.is_vls || b.pref.linfo.method !in [.definition, .completion, .signature_help] {
+				util.print_json_errors(json_errors)
+			}
 			// eprintln(json2.encode_pretty(json_errors))
 		}
-
 		if !b.pref.skip_warnings {
 			for file in b.parsed_files {
 				for err in file.warnings {

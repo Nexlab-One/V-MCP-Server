@@ -71,6 +71,13 @@ fn (mut c Checker) infix_expr(mut node ast.InfixExpr) ast.Type {
 					}
 				}
 			}
+		} else if mut node.right is ast.ArrayInit {
+			if node.right.exprs.len == 0 && node.right.elem_type == ast.void_type {
+				// handle arr << [] where [] is empty
+				info := c.table.sym(left_type).array_info()
+				node.right.elem_type = info.elem_type
+				c.expected_type = info.elem_type
+			}
 		}
 	}
 	mut right_type := c.expr(mut node.right)
@@ -88,7 +95,7 @@ fn (mut c Checker) infix_expr(mut node ast.InfixExpr) ast.Type {
 		&& right_type in [ast.int_literal_type, ast.float_literal_type] {
 		node.right_type = left_type
 		if left_type in [ast.f32_type_idx, ast.f64_type_idx] && right_type == ast.float_literal_type {
-			defer {
+			defer(fn) {
 				node.right = ast.CastExpr{
 					expr:      node.right
 					typ:       left_type
@@ -103,7 +110,7 @@ fn (mut c Checker) infix_expr(mut node ast.InfixExpr) ast.Type {
 		&& left_type in [ast.int_literal_type, ast.float_literal_type] {
 		node.left_type = right_type
 		if right_type in [ast.f32_type_idx, ast.f64_type_idx] && left_type == ast.float_literal_type {
-			defer {
+			defer(fn) {
 				node.left = ast.CastExpr{
 					expr:      node.left
 					typ:       right_type
@@ -651,22 +658,12 @@ fn (mut c Checker) infix_expr(mut node ast.InfixExpr) ast.Type {
 			} else if left_type.is_unsigned() {
 				left_type
 			} else {
-				// signed types' idx adds with 5 will get correct relative unsigned type
-				// i8 	=> byte
-				// i16 	=> u16
-				// int  	=> u32
-				// i64  	=> u64
-				// isize	=> usize
-				// i128 	=> u128 NOT IMPLEMENTED YET
-				ast.idx_to_type(match left_type.idx() {
-					ast.i8_type_idx { ast.u8_type_idx }
-					ast.i16_type_idx { ast.u16_type_idx }
-					ast.i32_type_idx { ast.u32_type_idx }
-					ast.int_type_idx { ast.u32_type_idx }
-					ast.i64_type_idx { ast.u64_type_idx }
-					ast.isize_type_idx { ast.usize_type_idx }
-					else { 0 }
-				})
+				unsigned_type := left_type.flip_signedness()
+				if unsigned_type == ast.void_type {
+					// signed type can't convert to an unsigned type
+					0
+				}
+				unsigned_type
 			}
 
 			if modified_left_type == 0 {
@@ -871,9 +868,26 @@ fn (mut c Checker) infix_expr(mut node ast.InfixExpr) ast.Type {
 			right_type = c.unwrap_generic(right_type)
 			right_sym = c.table.sym(right_type)
 		}
-		if !(c.symmetric_check(left_type, right_type) && c.symmetric_check(right_type, left_type))
-			&& !c.pref.translated && !c.file.is_translated && !node.left.is_auto_deref_var()
-			&& !node.right.is_auto_deref_var() {
+		types_match := c.symmetric_check(left_type, right_type)
+			&& c.symmetric_check(right_type, left_type)
+		mut types_match_after_deref := false
+		mut deref_left_type := left_type
+		mut deref_right_type := right_type
+		if !types_match && (node.left.is_auto_deref_var() || node.right.is_auto_deref_var()) {
+			deref_left_type = if node.left.is_auto_deref_var() {
+				left_type.deref()
+			} else {
+				left_type
+			}
+			deref_right_type = if node.right.is_auto_deref_var() {
+				right_type.deref()
+			} else {
+				right_type
+			}
+			types_match_after_deref = c.symmetric_check(deref_left_type, deref_right_type)
+				&& c.symmetric_check(deref_right_type, deref_left_type)
+		}
+		if !types_match && !types_match_after_deref && !c.pref.translated && !c.file.is_translated {
 			// for type-unresolved consts
 			if left_type == ast.void_type || right_type == ast.void_type {
 				return ast.void_type
@@ -886,7 +900,17 @@ fn (mut c Checker) infix_expr(mut node ast.InfixExpr) ast.Type {
 			if node.right is ast.None && left_is_option {
 				return ast.bool_type
 			}
-			c.error('infix expr: cannot use `${right_sym.name}` (right expression) as `${left_sym.name}`',
+			error_left_sym := if node.left.is_auto_deref_var() {
+				c.table.sym(deref_left_type)
+			} else {
+				left_sym
+			}
+			error_right_sym := if node.right.is_auto_deref_var() {
+				c.table.sym(deref_right_type)
+			} else {
+				right_sym
+			}
+			c.error('infix expr: cannot use `${error_right_sym.name}` (right expression) as `${error_left_sym.name}`',
 				left_right_pos)
 		} else if left_type.is_ptr() {
 			for_ptr_op := c.table.type_is_for_pointer_arithmetic(left_type)

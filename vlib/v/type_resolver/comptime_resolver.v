@@ -71,8 +71,21 @@ pub fn (t &ResolverInfo) is_comptime_variant_var(node ast.Ident) bool {
 
 // typeof_type resolves type for typeof() expr where field.typ is resolved to real type instead of int type to make type(field.typ).name working
 pub fn (mut t TypeResolver) typeof_type(node ast.Expr, default_type ast.Type) ast.Type {
+	if node is ast.Ident {
+		if t.info.inside_comptime_for && t.info.comptime_for_field_var != '' {
+			if node.obj is ast.Var {
+				obj_typ := node.obj.typ
+				field_typ := t.info.comptime_for_field_type
+				if (obj_typ.has_flag(.option) && field_typ.has_flag(.option))
+					|| (obj_typ.clear_flag(.option).idx() == field_typ.clear_flag(.option).idx()
+					&& obj_typ.has_flag(.option)) {
+					return field_typ.clear_flag(.option)
+				}
+			}
+		}
+	}
 	if t.info.is_comptime(node) {
-		return t.get_type(node)
+		return t.get_type(node).clear_flag(.option)
 	} else if node is ast.SelectorExpr && node.expr_type != 0 {
 		if node.expr is ast.Ident && node.is_field_typ {
 			return t.get_type_from_comptime_var(node.expr)
@@ -224,6 +237,7 @@ pub fn (mut t TypeResolver) get_comptime_selector_bool_field(field_name string) 
 	match field_name {
 		'is_pub' { return field.is_pub }
 		'is_mut' { return field.is_mut }
+		'is_embed' { return field.is_embed }
 		'is_shared' { return field_typ.has_flag(.shared_f) }
 		'is_atomic' { return field_typ.has_flag(.atomic_f) }
 		'is_option' { return field.typ.has_flag(.option) }
@@ -292,6 +306,9 @@ pub fn (t &TypeResolver) is_comptime_type(x ast.Type, y ast.ComptimeType) bool {
 		}
 		.option {
 			return x.has_flag(.option)
+		}
+		.shared {
+			return x.has_flag(.shared_f)
 		}
 	}
 }

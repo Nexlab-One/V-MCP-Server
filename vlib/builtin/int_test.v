@@ -17,7 +17,11 @@ fn test_str_methods() {
 	assert int(1).str() == '1'
 	assert int(-1).str() == '-1'
 	assert int(2147483647).str() == '2147483647'
-	assert int(u32(2147483648)).str() == '-2147483648'
+	assert int(u32(2147483648)).str() == $if new_int ? && x64 {
+		'2147483648'
+	} $else {
+		'-2147483648'
+	}
 	assert int(-2147483648).str() == '-2147483648'
 	assert i64(1).str() == '1'
 	assert i64(-1).str() == '-1'
@@ -35,6 +39,18 @@ fn test_str_methods() {
 	assert byteptr(1).str() == '0x1'
 	assert charptr(-1).str() == '0xffffffffffffffff'
 	assert charptr(1).str() == '0x1'
+}
+
+fn test_str_length() {
+	assert i8(-125).str() == '-125'
+	assert i16(-32760).str() == '-32760'
+	assert i32(-2147483610).str() == '-2147483610'
+	assert int(-2147483620).str() == '-2147483620'
+	assert i64(-9223372036854775801).str() == '-9223372036854775801'
+	assert u8(250).str() == '250'
+	assert u16(65530).str() == '65530'
+	assert u32(4294967250).str() == '4294967250'
+	assert u64(18446744073709551611).str() == '18446744073709551611'
 }
 
 fn test_and_precedence() {
@@ -267,4 +283,13 @@ fn test_int_max() {
 	assert int_max(5, 0) == 5
 	assert int_max(-5, 5) == 5
 	assert int_max(5, -5) == 5
+}
+
+fn test_big_int() {
+	x := i64(2147483647)
+	if x > -2147483649 && x < 2147483648 {
+		assert true
+	} else {
+		assert false
+	}
 }

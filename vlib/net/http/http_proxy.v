@@ -31,6 +31,8 @@ pub fn new_http_proxy(raw_url string) !&HttpProxy {
 	url.raw_path = ''
 	url.raw_query = ''
 	url.fragment = ''
+	mut username := ''
+	mut password := ''
 
 	str_url := url.str()
 
@@ -50,10 +52,15 @@ pub fn new_http_proxy(raw_url string) !&HttpProxy {
 		return error('Unknown port')
 	}
 
+	if u := url.user {
+		username = u.username
+		password = u.password
+	}
+
 	return &HttpProxy{
 		scheme:   scheme
-		username: url.user.username
-		password: url.user.password
+		username: username
+		password: password
 		host:     host
 		hostname: url.hostname()
 		port:     port
@@ -87,7 +94,9 @@ fn (pr &HttpProxy) build_proxy_headers(host string) string {
 fn (pr &HttpProxy) http_do(host urllib.URL, method Method, path string, req &Request) !Response {
 	host_name, port := net.split_address(host.hostname())!
 
-	s := req.build_request_headers(req.method, host_name, port, path)
+	port_part := if port == 80 || port == 0 { '' } else { ':${port}' }
+
+	s := req.build_request_headers(req.method, host_name, port, '${host.scheme}://${host_name}${port_part}${path}')
 	if host.scheme == 'https' {
 		mut client := pr.ssl_dial('${host.host}:443')!
 

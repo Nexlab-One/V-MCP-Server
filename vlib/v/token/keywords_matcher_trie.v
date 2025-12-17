@@ -11,11 +11,24 @@ pub mut:
 	max_len int
 }
 
+// str returns a short representation of matcher
+pub fn (km &KeywordsMatcherTrie) str() string {
+	return 'KeywordsMatcherTrie{ /* nodes.len: ${km.nodes.len} */ min_len: ${km.min_len}, max_len: ${km.max_len} }'
+}
+
 // TrieNode is a single node from a trie, used by KeywordsMatcherTrie
 pub struct TrieNode {
 pub mut:
 	children [123]&TrieNode
 	value    int = -1 // when != -1, it is a leaf node representing a match
+}
+
+// str returns a string representation of the node content
+pub fn (node &TrieNode) str() string {
+	if isnil(node) {
+		return '&TrieNode(nil)'
+	}
+	return '&TrieNode{value: ${node.value}}'
 }
 
 // find tries to find the given `word` in the set of all previously added words
@@ -124,10 +137,11 @@ pub fn (node &TrieNode) show(level int) {
 // `word_idx` is just used as an accumulator, and starts from 0 at the root of the tree.
 @[direct_array_access]
 pub fn (mut node TrieNode) add_word(word string, value int, word_idx int) {
-	first := u8(word[word_idx] or {
+	if word_idx < 0 || word_idx >= word.len {
 		node.value = value
 		return
-	})
+	}
+	first := u8(word[word_idx])
 	// eprintln('>> node: ${ptr_str(node)} | first: $first | word_idx: $word_idx')
 	mut child_node := node.children[first]
 	if child_node == unsafe { nil } {

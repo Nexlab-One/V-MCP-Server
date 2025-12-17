@@ -1,5 +1,5 @@
 // vtest retry: 3
-// vtest build: !windows
+// vtest build: present_sqlite3? && !windows
 // import db.mysql
 // import db.pg
 import time
@@ -7,11 +7,12 @@ import db.sqlite
 
 const offset_const = 2
 
+@[index: 'name, nr_downloads']
 struct Module {
-	id           int @[primary; sql: serial]
-	name         string
+	id           int    @[primary; sql: serial]
+	name         string @[index]
 	nr_downloads int
-	test_id      u64
+	test_id      u64 @[index]
 	user         ?User
 	created      time.Time
 }
@@ -393,7 +394,9 @@ fn test_orm() {
 	// Note: usually updated_time_mod.created != t, because t has
 	// its microseconds set, while the value retrieved from the DB
 	// has them zeroed, because the db field resolution is seconds.
-	assert modules.first().created.format_ss() == t.format_ss()
+	// Note: the database also stores the time in UTC, so the
+	// comparison must be done on the unix timestamp.
+	assert modules.first().created.unix() == t.unix()
 
 	users = sql db {
 		select from User where (name == 'Sam' && is_customer == true) || id == 1

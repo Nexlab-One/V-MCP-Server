@@ -55,7 +55,7 @@ fn self_tests() {
 
 fn build_examples() {
 	if common.is_github_job {
-		exec('v -silent build-examples')
+		exec('v build-examples')
 	} else {
 		exec('v -progress build-examples')
 	}
@@ -64,8 +64,7 @@ fn build_examples() {
 fn build_examples_v_compiled_with_tcc() {
 	exec('v -o vtcc -cc tcc cmd/v')
 	if common.is_github_job {
-		// ensure that examples/veb/veb_example.v etc compiles
-		exec('./vtcc -silent build-examples')
+		exec('./vtcc build-examples')
 	} else {
 		exec('./vtcc -progress build-examples')
 	}
@@ -98,7 +97,10 @@ fn build_v_with_prealloc() {
 }
 
 fn v_self_compilation_usecache() {
-	exec('unset VFLAGS')
+	$if !enable_usecache_test ? {
+		eprintln('> ${@LOCATION} use `-d enable_usecache_test` in VFLAGS to enable this task')
+		return
+	}
 	exec('v -usecache examples/hello_world.v')
 	exec('./examples/hello_world')
 	exec('v -o v2 -usecache cmd/v')

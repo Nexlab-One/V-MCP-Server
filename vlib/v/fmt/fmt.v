@@ -18,41 +18,43 @@ pub struct Fmt {
 pub:
 	pref &pref.Preferences = unsafe { nil }
 pub mut:
-	file               ast.File
-	table              &ast.Table = unsafe { nil }
-	is_debug           bool
-	out                strings.Builder
-	out_imports        strings.Builder
-	indent             int
-	empty_line         bool
-	line_len           int    // the current line length, Note: it counts \t as 4 spaces, and starts at 0 after f.writeln
-	buffering          bool   // disables line wrapping for exprs that will be analyzed later
-	par_level          int    // how many parentheses are put around the current expression
-	array_init_break   []bool // line breaks after elements in hierarchy level of multi dimensional array
-	array_init_depth   int    // current level of hierarchy in array init
-	single_line_if     bool
-	cur_mod            string
-	did_imports        bool
-	import_pos         int               // position of the imports in the resulting string
-	auto_imports       map[string]bool   // potentially hidden imports(`sync` when using channels) and preludes(when embedding files)
-	used_imports       map[string]bool   // to remove unused imports
-	import_syms_used   map[string]bool   // to remove unused import symbols
-	mod2alias          map[string]string // for `import time as t`, will contain: 'time'=>'t'
-	mod2syms           map[string]string // import time { now } 'time.now'=>'now'
-	use_short_fn_args  bool
-	single_line_fields bool // should struct fields be on a single line
-	in_lambda_depth    int
-	inside_const       bool
-	inside_unsafe      bool
-	inside_comptime_if bool
-	is_assign          bool
-	is_index_expr      bool
-	is_mbranch_expr    bool // match a { x...y { } }
-	is_struct_init     bool
-	fn_scope           &ast.Scope = unsafe { nil }
-	wsinfix_depth      int
-	format_state       FormatState
-	source_text        string // can be set by `echo "println('hi')" | v fmt`, i.e. when processing source not from a file, but from stdin. In this case, it will contain the entire input text. You can use f.file.path otherwise, and read from that file.
+	file                     ast.File
+	table                    &ast.Table = unsafe { nil }
+	is_debug                 bool
+	out                      strings.Builder
+	indent                   int
+	empty_line               bool
+	line_len                 int    // the current line length, Note: it counts \t as 4 spaces, and starts at 0 after f.writeln
+	buffering                bool   // disables line wrapping for exprs that will be analyzed later
+	par_level                int    // how many parentheses are put around the current expression
+	array_init_break         []bool // line breaks after elements in hierarchy level of multi dimensional array
+	array_init_depth         int    // current level of hierarchy in array init
+	single_line_if           bool
+	cur_mod                  string
+	import_pos               int               // position of the last import in the resulting string
+	mod2alias                map[string]string // for `import time as t`, will contain: 'time'=>'t'
+	mod2syms                 map[string]string // import time { now } 'time.now'=>'now'
+	implied_import_str       string            // ​imports that the user's code uses but omitted to import explicitly
+	processed_imports        []string
+	has_import_stmt          bool
+	use_short_fn_args        bool
+	single_line_fields       bool // should struct fields be on a single line
+	in_lambda_depth          int
+	inside_const             bool
+	inside_unsafe            bool
+	inside_comptime_if       bool
+	is_assign                bool
+	is_index_expr            bool
+	is_mbranch_expr          bool // match a { x...y { } }
+	is_struct_init           bool
+	fn_scope                 &ast.Scope = unsafe { nil }
+	wsinfix_depth            int
+	format_state             FormatState
+	source_text              string // can be set by `echo "println('hi')" | v fmt`, i.e. when processing source not from a file, but from stdin. In this case, it will contain the entire input text. You can use f.file.path otherwise, and read from that file.
+	global_processed_imports []string
+	branch_processed_imports []string
+	is_translated_module     bool // @[translated]
+	is_c_function            bool // C.func(...)
 }
 
 @[params]
@@ -63,12 +65,11 @@ pub:
 
 pub fn fmt(file ast.File, mut table ast.Table, pref_ &pref.Preferences, is_debug bool, options FmtOptions) string {
 	mut f := Fmt{
-		file:        file
-		table:       table
-		pref:        pref_
-		is_debug:    is_debug
-		out:         strings.new_builder(1000)
-		out_imports: strings.new_builder(200)
+		file:     file
+		table:    table
+		pref:     pref_
+		is_debug: is_debug
+		out:      strings.new_builder(1000)
 	}
 	f.source_text = options.source_text
 	f.process_file_imports(file)
@@ -76,16 +77,15 @@ pub fn fmt(file ast.File, mut table ast.Table, pref_ &pref.Preferences, is_debug
 	f.indent--
 	f.stmts(file.stmts)
 	f.indent++
-	// Format after file import symbols are processed.
-	f.imports(f.file.imports)
 	res := f.out.str().trim_space() + '\n'
+
+	// `implied_imports` should append to end of `import` block
 	if res.len == 1 {
-		return f.out_imports.str().trim_space() + '\n'
+		return f.implied_import_str + '\n'
 	}
 	if res.len <= f.import_pos {
-		imp_str := f.out_imports.str().trim_space()
-		if imp_str.len > 0 {
-			return res + '\n' + imp_str + '\n'
+		if f.implied_import_str.len > 0 {
+			return res + '\n' + f.implied_import_str + '\n'
 		}
 		return res
 	}
@@ -98,14 +98,18 @@ pub fn fmt(file ast.File, mut table ast.Table, pref_ &pref.Preferences, is_debug
 			import_start_pos = stmt.pos.len
 		}
 	}
-	return res[..import_start_pos] + f.out_imports.str() + res[import_start_pos..]
+	if f.has_import_stmt || f.implied_import_str.len == 0 {
+		return res[..import_start_pos] + f.implied_import_str + res[import_start_pos..]
+	} else {
+		return res[..import_start_pos] + f.implied_import_str + '\n' + res[import_start_pos..]
+	}
 }
 
 /*
 // vfmt has a special type_to_str which calls Table.type_to_str, but does extra work.
 // Having it here and not in Table saves cpu cycles when not running the compiler in vfmt mode.
 pub fn (f &Fmt) type_to_str_using_aliases(typ ast.Type, import_aliases map[string]string) string {
-	mut s := f.table.type_to_str_using_aliases(typ, import_aliases)
+	mut s := f.type_to_str_using_aliases(typ, import_aliases)
 	if s.contains('Result') {
 		println('${s}')
 	}
@@ -116,11 +120,30 @@ pub fn (f &Fmt) type_to_str_using_aliases(typ ast.Type, import_aliases map[strin
 }
 
 pub fn (f &Fmt) type_to_str(typ ast.Type) string {
-	return f.table.type_to_str(typ)
+	return f.type_to_str(typ)
 }
 */
+fn (f &Fmt) type_to_str_using_aliases(typ ast.Type, import_aliases map[string]string) string {
+	if f.table.new_int && typ == ast.int_type && (f.is_translated_module || f.is_c_function) {
+		return f.type_to_str_using_aliases(ast.i32_type, import_aliases)
+	}
+	return f.table.type_to_str_using_aliases(typ, import_aliases)
+}
+
+fn (f &Fmt) type_to_str(typ ast.Type) string {
+	if f.table.new_int && typ == ast.int_type && (f.is_translated_module || f.is_c_function) {
+		return 'i32'
+	}
+	return f.table.type_to_str(typ)
+}
 
 pub fn (mut f Fmt) process_file_imports(file &ast.File) {
+	mut sb := strings.new_builder(128)
+	for imp in file.implied_imports {
+		sb.writeln('import ${imp}')
+	}
+	f.implied_import_str = sb.str()
+
 	for imp in file.imports {
 		f.mod2alias[imp.mod] = imp.alias
 		f.mod2alias[imp.mod.all_after('${file.mod.name}.')] = imp.alias
@@ -131,11 +154,7 @@ pub fn (mut f Fmt) process_file_imports(file &ast.File) {
 			f.mod2syms['${imp.mod}.${sym.name}'] = sym.name
 			f.mod2syms['${imp.mod.all_after_last('.')}.${sym.name}'] = sym.name
 			f.mod2syms[sym.name] = sym.name
-			f.import_syms_used[sym.name] = false
 		}
-	}
-	for mod in f.file.auto_imports {
-		f.auto_imports[mod] = true
 	}
 }
 
@@ -186,15 +205,9 @@ pub fn (mut f Fmt) wrap_long_line(penalty_idx int, add_indent bool) bool {
 	return true
 }
 
-@[params]
-pub struct RemoveNewLineConfig {
-pub:
-	imports_buffer bool // Work on f.out_imports instead of f.out
-}
-
 // When the removal action actually occurs, the string of the last line after the removal is returned
-pub fn (mut f Fmt) remove_new_line(cfg RemoveNewLineConfig) string {
-	mut buffer := if cfg.imports_buffer { unsafe { &f.out_imports } } else { unsafe { &f.out } }
+pub fn (mut f Fmt) remove_new_line() string {
+	mut buffer := unsafe { &f.out }
 	mut i := 0
 	for i = buffer.len - 1; i >= 0; i-- {
 		if !buffer.byte_at(i).is_space() { // != `\n` {
@@ -234,7 +247,7 @@ fn (mut f Fmt) write_language_prefix(lang ast.Language) {
 fn (mut f Fmt) write_generic_types(gtypes []ast.Type) {
 	if gtypes.len > 0 {
 		f.write('[')
-		gtypes_string := gtypes.map(f.table.type_to_str(it)).join(', ')
+		gtypes_string := gtypes.map(f.type_to_str(it)).join(', ')
 		f.write(gtypes_string)
 		f.write(']')
 	}
@@ -314,76 +327,35 @@ pub fn (mut f Fmt) short_module(name string) string {
 
 //=== Import-related methods ===//
 
-pub fn (mut f Fmt) mark_types_import_as_used(typ ast.Type) {
-	sym := f.table.sym(typ)
-	match sym.info {
-		ast.Map {
-			map_info := sym.map_info()
-			f.mark_types_import_as_used(map_info.key_type)
-			f.mark_types_import_as_used(map_info.value_type)
-			return
-		}
-		ast.Array, ast.ArrayFixed {
-			f.mark_types_import_as_used(sym.info.elem_type)
-			return
-		}
-		ast.GenericInst {
-			for concrete_typ in sym.info.concrete_types {
-				f.mark_types_import_as_used(concrete_typ)
-			}
-		}
-		else {}
-	}
-	// `Type[T]` -> `Type` || `[]thread Type` -> `Type`.
-	name := sym.name.all_before('[').all_after(' ')
-	f.mark_import_as_used(name)
-}
-
-pub fn (mut f Fmt) mark_import_as_used(name string) {
-	parts := name.split('.')
-	sym := parts.last()
-	if sym in f.import_syms_used {
-		f.import_syms_used[sym] = true
-	}
-	if parts.len == 1 {
+pub fn (mut f Fmt) import_stmt(imp ast.Import) {
+	f.has_import_stmt = true
+	if imp.mod in f.file.auto_imports && imp.mod !in f.file.used_imports {
+		// Skip hidden imports like preludes.
 		return
 	}
-	mod := parts[..parts.len - 1].join('.')
-	f.used_imports[mod] = true
-}
-
-pub fn (mut f Fmt) imports(imports []ast.Import) {
-	if f.did_imports || imports.len == 0 {
+	imp_stmt := f.imp_stmt_str(imp)
+	if imp_stmt in f.global_processed_imports
+		|| (f.inside_comptime_if && imp_stmt in f.branch_processed_imports) {
+		// Skip duplicates.
+		f.import_comments(imp.next_comments)
 		return
 	}
-	f.did_imports = true
-	mut processed_imports := map[string]bool{}
-	for imp in imports {
-		if imp.mod in f.auto_imports && imp.mod !in f.used_imports {
-			// Skip hidden imports like preludes.
-			continue
-		}
-		imp_stmt := f.imp_stmt_str(imp)
-		if imp_stmt in processed_imports {
-			// Skip duplicates.
-			f.import_comments(imp.next_comments)
-			continue
-		}
-		processed_imports[imp_stmt] = true
-		if !f.format_state.is_vfmt_on {
-			original_imp_line := f.get_source_lines()#[imp.pos.line_nr..imp.pos.last_line + 1].join('\n')
-			// Same line comments(`imp.comments`) are included in the `original_imp_line`.
-			f.out_imports.writeln(original_imp_line)
-			f.import_comments(imp.next_comments)
-		} else {
-			f.out_imports.writeln('import ${imp_stmt}')
-			f.import_comments(imp.comments, same_line: true)
-			f.import_comments(imp.next_comments)
-		}
+	if f.inside_comptime_if {
+		f.branch_processed_imports << imp_stmt
+	} else {
+		f.global_processed_imports << imp_stmt
 	}
-	if processed_imports.len > 0 {
-		f.out_imports.writeln('')
+	if !f.format_state.is_vfmt_on {
+		original_imp_line := f.get_source_lines()#[imp.pos.line_nr..imp.pos.last_line + 1].join('\n')
+		// Same line comments(`imp.comments`) are included in the `original_imp_line`.
+		f.writeln(original_imp_line)
+		f.import_comments(imp.next_comments)
+	} else {
+		f.writeln('import ${imp_stmt}')
+		f.import_comments(imp.comments, same_line: true)
+		f.import_comments(imp.next_comments)
 	}
+	f.import_pos = f.out.len
 }
 
 pub fn (f &Fmt) imp_stmt_str(imp ast.Import) string {
@@ -391,7 +363,7 @@ pub fn (f &Fmt) imp_stmt_str(imp ast.Import) string {
 	// E.g.: `import foo { Foo }` || `import foo as f { Foo }`
 	has_alias := imp.alias != imp.source_name.all_after_last('.')
 	mut suffix := if has_alias { ' as ${imp.alias}' } else { '' }
-	mut syms := imp.syms.map(it.name).filter(f.import_syms_used[it])
+	mut syms := imp.syms.map(it.name).filter(f.file.imported_symbols_used[it])
 	syms.sort()
 	if syms.len > 0 {
 		suffix += if imp.syms[0].pos.line_nr == imp.pos.line_nr {
@@ -440,9 +412,9 @@ fn (f &Fmt) should_insert_newline_before_node(node ast.Node, prev_node ast.Node)
 					return true
 				}
 			}
-			// Imports are handled special hence they are ignored here
+			// Force a newline after imports
 			ast.Import {
-				return false
+				return node !is ast.Import
 			}
 			ast.ConstDecl {
 				if node !is ast.ConstDecl && !(node is ast.ExprStmt && node.expr is ast.Comment) {
@@ -572,9 +544,7 @@ pub fn (mut f Fmt) stmt(node ast.Stmt) {
 			f.hash_stmt(node)
 		}
 		ast.Import {
-			// Imports are handled after the file is formatted, to automatically add necessary modules
-			// Just remember the position of the imports for now
-			f.import_pos = f.out.len
+			f.import_stmt(node)
 		}
 		ast.InterfaceDecl {
 			f.interface_decl(node)
@@ -800,6 +770,7 @@ pub fn (mut f Fmt) expr(node_ ast.Expr) {
 				.alias { f.write('\$alias') }
 				.function { f.write('\$function') }
 				.option { f.write('\$option') }
+				.shared { f.write('\$shared') }
 				.string { f.write('\$string') }
 				.pointer { f.write('\$pointer') }
 				.voidptr { f.write('\$voidptr') }
@@ -927,14 +898,11 @@ pub fn (mut f Fmt) branch_stmt(node ast.BranchStmt) {
 
 pub fn (mut f Fmt) comptime_for(node ast.ComptimeFor) {
 	typ := if node.typ != ast.void_type {
-		f.no_cur_mod(f.table.type_to_str_using_aliases(node.typ, f.mod2alias))
+		f.no_cur_mod(f.type_to_str_using_aliases(node.typ, f.mod2alias))
 	} else {
 		(node.expr as ast.Ident).name
 	}
 	f.write('\$for ${node.val_var} in ${typ}.${node.kind.str()} {')
-	if node.typ != ast.void_type {
-		f.mark_types_import_as_used(node.typ)
-	}
 	if node.stmts.len > 0 || node.pos.line_nr < node.pos.last_line {
 		f.writeln('')
 		f.stmts(node.stmts)
@@ -989,7 +957,7 @@ pub fn (mut f Fmt) const_decl(node ast.ConstDecl) {
 		f.write('${name} ')
 		if field.is_virtual_c {
 			// f.typ(field.typ)
-			f.write(f.table.type_to_str(field.typ))
+			f.write(f.type_to_str(field.typ))
 		} else {
 			f.write('= ')
 			f.expr(field.expr)
@@ -1013,12 +981,15 @@ pub fn (mut f Fmt) const_decl(node ast.ConstDecl) {
 }
 
 fn (mut f Fmt) defer_stmt(node ast.DeferStmt) {
-	f.write('defer ')
+	f.write('defer')
+	if node.mode == .function {
+		f.write('(fn)')
+	}
 	if node.stmts.len == 0 {
-		f.writeln('{}')
+		f.writeln(' {}')
 	} else if node.stmts.len == 1 && node.pos.line_nr == node.pos.last_line
 		&& stmt_is_single_line(node.stmts[0]) {
-		f.write('{ ')
+		f.write(' { ')
 		// the control stmts (return/break/continue...) print a newline inside them,
 		// so, since this'll all be on one line, trim any possible whitespace
 		str := f.node_str(node.stmts[0]).trim_space()
@@ -1032,7 +1003,7 @@ fn (mut f Fmt) defer_stmt(node ast.DeferStmt) {
 		// f.stmt(node.stmts[0])
 		f.writeln(' }')
 	} else {
-		f.writeln('{')
+		f.writeln(' {')
 		f.stmts(node.stmts)
 		f.writeln('}')
 	}
@@ -1053,7 +1024,7 @@ pub fn (mut f Fmt) enum_decl(node ast.EnumDecl) {
 	}
 	mut name := node.name.after('.')
 	if node.typ != ast.int_type && node.typ != ast.invalid_type {
-		senum_type := f.table.type_to_str_using_aliases(node.typ, f.mod2alias)
+		senum_type := f.type_to_str_using_aliases(node.typ, f.mod2alias)
 		name += ' as ${senum_type}'
 	}
 	if node.fields.len == 0 && node.pos.line_nr == node.pos.last_line {
@@ -1125,12 +1096,18 @@ pub fn (mut f Fmt) enum_decl(node ast.EnumDecl) {
 		f.writeln('')
 		f.comments(field.next_comments, has_nl: true, level: .indent)
 	}
-	f.writeln('}\n')
+	f.writeln('}')
 }
 
 pub fn (mut f Fmt) fn_decl(node ast.FnDecl) {
 	f.attrs(node.attrs)
+	if node.name.starts_with('C.') {
+		f.is_c_function = true
+	}
+	f.table.new_int_fmt_fix = f.table.new_int && (f.is_translated_module || f.is_c_function)
 	f.write(f.table.stringify_fn_decl(&node, f.cur_mod, f.mod2alias, true))
+	f.table.new_int_fmt_fix = false
+	f.is_c_function = false
 	// Handle trailing comments after fn header declarations
 	if node.no_body && node.end_comments.len > 0 {
 		first_comment := node.end_comments[0]
@@ -1155,7 +1132,9 @@ pub fn (mut f Fmt) fn_decl(node ast.FnDecl) {
 }
 
 pub fn (mut f Fmt) anon_fn(node ast.AnonFn) {
+	f.table.new_int_fmt_fix = f.table.new_int && (f.is_translated_module || f.is_c_function)
 	f.write(f.table.stringify_anon_decl(&node, f.cur_mod, f.mod2alias)) // `Expr` instead of `ast.Expr` in mod ast
+	f.table.new_int_fmt_fix = false
 	f.fn_body(node.decl)
 }
 
@@ -1202,11 +1181,6 @@ fn (mut f Fmt) fn_body(node ast.FnDecl) {
 	} else {
 		f.writeln('')
 	}
-	// Mark all function's used type so that they are not removed from imports
-	for arg in node.params {
-		f.mark_types_import_as_used(arg.typ)
-	}
-	f.mark_types_import_as_used(node.return_type)
 }
 
 pub fn (mut f Fmt) for_c_stmt(node ast.ForCStmt) {
@@ -1350,12 +1324,11 @@ pub fn (mut f Fmt) global_decl(node ast.GlobalDecl) {
 			f.write('= ')
 			f.expr(field.expr)
 		} else {
-			f.write('${f.table.type_to_str_using_aliases(field.typ, f.mod2alias)}')
+			f.write('${f.type_to_str_using_aliases(field.typ, f.mod2alias)}')
 		}
 		if node.is_block {
 			f.writeln('')
 		}
-		f.mark_types_import_as_used(field.typ)
 	}
 	f.comments_after_last_field(node.end_comments)
 	if node.is_block {
@@ -1436,7 +1409,9 @@ pub fn (mut f Fmt) interface_decl(node ast.InterfaceDecl) {
 	for method in node.methods {
 		end_comments := method.comments.filter(it.pos.pos > method.pos.pos)
 		if end_comments.len > 0 {
+			f.table.new_int_fmt_fix = f.table.new_int && (f.is_translated_module || f.is_c_function)
 			method_str := f.table.stringify_fn_decl(&method, f.cur_mod, f.mod2alias, false).all_after_first('fn ')
+			f.table.new_int_fmt_fix = false
 			method_comment_align.add_info(method_str.len, method.pos.line_nr, method.has_break_line)
 		}
 	}
@@ -1484,7 +1459,7 @@ pub fn (mut f Fmt) calculate_alignment(fields []ast.StructField, mut type_align 
 	// Calculate the alignments first
 	mut prev_state := AlignState.plain
 	for field in fields {
-		ft := f.no_cur_mod(f.table.type_to_str_using_aliases(field.typ, f.mod2alias))
+		ft := f.no_cur_mod(f.type_to_str_using_aliases(field.typ, f.mod2alias))
 		// Handle anon structs recursively
 		field_types << ft
 		attrs_len := inline_attrs_len(field.attrs)
@@ -1531,7 +1506,7 @@ pub fn (mut f Fmt) calculate_alignment(fields []ast.StructField, mut type_align 
 }
 
 pub fn (mut f Fmt) interface_field(field ast.StructField, mut type_align FieldAlign, mut comment_align FieldAlign) {
-	ft := f.no_cur_mod(f.table.type_to_str_using_aliases(field.typ, f.mod2alias))
+	ft := f.no_cur_mod(f.type_to_str_using_aliases(field.typ, f.mod2alias))
 	mut pre_cmts, mut end_cmts, mut next_line_cmts := []ast.Comment{}, []ast.Comment{}, []ast.Comment{}
 	for cmt in field.comments {
 		match true {
@@ -1568,7 +1543,6 @@ pub fn (mut f Fmt) interface_field(field ast.StructField, mut type_align FieldAl
 	if next_line_cmts.len > 0 {
 		f.comments(next_line_cmts, level: .indent)
 	}
-	f.mark_types_import_as_used(field.typ)
 }
 
 pub fn (mut f Fmt) interface_method(method ast.FnDecl, mut comment_align FieldAlign) {
@@ -1578,7 +1552,9 @@ pub fn (mut f Fmt) interface_method(method ast.FnDecl, mut comment_align FieldAl
 		f.comments(before_comments, level: .indent)
 	}
 	f.write('\t')
+	f.table.new_int_fmt_fix = f.table.new_int && (f.is_translated_module || f.is_c_function)
 	method_str := f.table.stringify_fn_decl(&method, f.cur_mod, f.mod2alias, false).all_after_first('fn ')
+	f.table.new_int_fmt_fix = false
 	f.write(method_str)
 	if end_comments.len > 0 {
 		f.write(' '.repeat(comment_align.max_len(method.pos.line_nr) - method_str.len + 1))
@@ -1587,10 +1563,6 @@ pub fn (mut f Fmt) interface_method(method ast.FnDecl, mut comment_align FieldAl
 		f.writeln('')
 	}
 	f.comments(method.next_comments, level: .indent)
-	for param in method.params {
-		f.mark_types_import_as_used(param.typ)
-	}
-	f.mark_types_import_as_used(method.return_type)
 }
 
 pub fn (mut f Fmt) module_stmt(mod ast.Module) {
@@ -1598,6 +1570,7 @@ pub fn (mut f Fmt) module_stmt(mod ast.Module) {
 	if mod.is_skipped {
 		return
 	}
+	f.is_translated_module = mod.attrs.any(it.name == 'translated')
 	f.attrs(mod.attrs)
 	f.writeln('module ${mod.short_name}\n')
 	if f.import_pos == 0 {
@@ -1655,7 +1628,6 @@ pub fn (mut f Fmt) sql_stmt_line(node ast.SqlStmtLine) {
 		table_name = f.no_cur_mod(f.short_module(sym.name)) // TODO: f.type_to_str?
 	}
 
-	f.mark_types_import_as_used(node.table_expr.typ)
 	f.write('\t')
 	match node.kind {
 		.insert {
@@ -1712,15 +1684,13 @@ pub fn (mut f Fmt) alias_type_decl(node ast.AliasTypeDecl) {
 			f.write('type ${node.name} = ')
 			f.struct_decl(ast.StructDecl{ fields: sym.info.fields }, true)
 			f.comments(node.comments, has_nl: false)
-			f.mark_types_import_as_used(node.parent_type)
 			return
 		}
 	}
-	ptype := f.table.type_to_str_using_aliases(node.parent_type, f.mod2alias)
+	ptype := f.type_to_str_using_aliases(node.parent_type, f.mod2alias)
 	f.write('type ${node.name} = ${ptype}')
 
 	f.comments(node.comments, has_nl: false)
-	f.mark_types_import_as_used(node.parent_type)
 }
 
 pub fn (mut f Fmt) fn_type_decl(node ast.FnTypeDecl) {
@@ -1743,8 +1713,7 @@ pub fn (mut f Fmt) fn_type_decl(node ast.FnTypeDecl) {
 			f.write(arg.typ.share().str() + ' ')
 		}
 		f.write(arg.name)
-		f.mark_types_import_as_used(arg.typ)
-		mut s := f.no_cur_mod(f.table.type_to_str_using_aliases(arg.typ, f.mod2alias))
+		mut s := f.no_cur_mod(f.type_to_str_using_aliases(arg.typ, f.mod2alias))
 		if arg.is_mut {
 			if s.starts_with('&') {
 				s = s[1..]
@@ -1769,9 +1738,7 @@ pub fn (mut f Fmt) fn_type_decl(node ast.FnTypeDecl) {
 	}
 	f.write(')')
 	if fn_info.return_type.idx() != ast.void_type_idx {
-		f.mark_types_import_as_used(fn_info.return_type)
-		ret_str := f.no_cur_mod(f.table.type_to_str_using_aliases(fn_info.return_type,
-			f.mod2alias))
+		ret_str := f.no_cur_mod(f.type_to_str_using_aliases(fn_info.return_type, f.mod2alias))
 		f.write(' ${ret_str}')
 	} else if fn_info.return_type.has_flag(.option) {
 		f.write(' ?')
@@ -1800,8 +1767,7 @@ pub fn (mut f Fmt) sum_type_decl(node ast.SumTypeDecl) {
 
 	mut variants := []Variant{cap: node.variants.len}
 	for i, variant in node.variants {
-		variants << Variant{f.table.type_to_str_using_aliases(variant.typ, f.mod2alias), i}
-		f.mark_types_import_as_used(variant.typ)
+		variants << Variant{f.type_to_str_using_aliases(variant.typ, f.mod2alias), i}
 	}
 	// The first variant is now used as the default variant when doing `a:= Sumtype{}`, i.e. a change in semantics.
 	// Sorting is disabled, because it is no longer a cosmetic change - it can change the default variant.
@@ -1851,11 +1817,10 @@ pub fn (mut f Fmt) array_init(node ast.ArrayInit) {
 	}
 	if node.exprs.len == 0 && node.typ != 0 && node.typ != ast.void_type {
 		// `x := []string{}`
-		f.mark_types_import_as_used(node.typ)
 		if node.alias_type != ast.void_type {
-			f.write(f.table.type_to_str_using_aliases(node.alias_type, f.mod2alias))
+			f.write(f.type_to_str_using_aliases(node.alias_type, f.mod2alias))
 		} else {
-			f.write(f.table.type_to_str_using_aliases(node.typ, f.mod2alias))
+			f.write(f.type_to_str_using_aliases(node.typ, f.mod2alias))
 		}
 		f.write('{')
 		if node.has_len {
@@ -2042,7 +2007,7 @@ pub fn (mut f Fmt) array_init(node ast.ArrayInit) {
 			f.write('!')
 			return
 		}
-		f.write(f.table.type_to_str_using_aliases(node.elem_type, f.mod2alias))
+		f.write(f.type_to_str_using_aliases(node.elem_type, f.mod2alias))
 		if node.has_init {
 			f.write('{init: ')
 			f.expr(node.init_expr)
@@ -2054,8 +2019,7 @@ pub fn (mut f Fmt) array_init(node ast.ArrayInit) {
 }
 
 pub fn (mut f Fmt) as_cast(node ast.AsCast) {
-	f.mark_types_import_as_used(node.typ)
-	type_str := f.table.type_to_str_using_aliases(node.typ, f.mod2alias)
+	type_str := f.type_to_str_using_aliases(node.typ, f.mod2alias)
 	f.expr(node.expr)
 	f.write(' as ${type_str}')
 }
@@ -2078,7 +2042,6 @@ pub fn (mut f Fmt) at_expr(node ast.AtExpr) {
 }
 
 fn (mut f Fmt) write_static_method(name string, short_name string) {
-	f.mark_import_as_used(name.split('__static__')[0])
 	if short_name.contains('.') {
 		indx := short_name.index('.') or { -1 } + 1
 		f.write(short_name[0..indx] + short_name[indx..].replace('__static__', '.').capitalize())
@@ -2090,23 +2053,9 @@ fn (mut f Fmt) write_static_method(name string, short_name string) {
 pub fn (mut f Fmt) call_expr(node ast.CallExpr) {
 	mut is_method_newline := false
 	if node.is_method {
-		if node.name in ['map', 'filter', 'all', 'any', 'count'] {
+		if ast.builtin_array_generic_methods_no_sort_matcher.matches(node.name) {
 			f.in_lambda_depth++
-			defer { f.in_lambda_depth-- }
-		}
-		if node.left is ast.Ident {
-			// `time.now()` without `time imported` is processed as a method call with `time` being
-			// a `node.left` expression. Import `time` automatically.
-			// TODO: fetch all available modules
-			if node.left.name in ['time', 'os', 'strings', 'math', 'json', 'base64']
-				&& !node.left.scope.known_var(node.left.name) {
-				f.file.imports << ast.Import{
-					source_name: node.left.name
-					mod:         node.left.name
-					alias:       node.left.name
-				}
-				f.used_imports[node.left.name] = true
-			}
+			defer(fn) { f.in_lambda_depth-- }
 		}
 		f.expr(node.left)
 		is_method_newline = node.left.pos().last_line != node.name_pos.line_nr
@@ -2126,7 +2075,6 @@ pub fn (mut f Fmt) call_expr(node ast.CallExpr) {
 			if node.is_static_method {
 				f.write_static_method(node.name, name)
 			} else {
-				f.mark_import_as_used(name)
 				f.write(name)
 			}
 		}
@@ -2153,7 +2101,7 @@ fn (mut f Fmt) write_generic_call_if_require(node ast.CallExpr) {
 	if node.concrete_types.len > 0 {
 		f.write('[')
 		for i, concrete_type in node.concrete_types {
-			mut name := f.table.type_to_str_using_aliases(concrete_type, f.mod2alias)
+			mut name := f.type_to_str_using_aliases(concrete_type, f.mod2alias)
 			tsym := f.table.sym(concrete_type)
 			if tsym.language != .js && !tsym.name.starts_with('JS.') {
 				name = f.short_module(name)
@@ -2164,7 +2112,6 @@ fn (mut f Fmt) write_generic_call_if_require(node ast.CallExpr) {
 				name = 'C.' + name
 			}
 			f.write(name)
-			f.mark_types_import_as_used(concrete_type)
 			if i != node.concrete_types.len - 1 {
 				f.write(', ')
 			}
@@ -2212,7 +2159,7 @@ pub fn (mut f Fmt) call_args(args []ast.CallArg) {
 }
 
 pub fn (mut f Fmt) cast_expr(node ast.CastExpr) {
-	typ := f.table.type_to_str_using_aliases(node.typ, f.mod2alias)
+	typ := f.type_to_str_using_aliases(node.typ, f.mod2alias)
 	if typ == 'voidptr' {
 		// `voidptr(0)` => `nil`
 		if node.expr is ast.IntegerLiteral {
@@ -2227,7 +2174,6 @@ pub fn (mut f Fmt) cast_expr(node ast.CastExpr) {
 		}
 	}
 	f.write('${typ}(')
-	f.mark_types_import_as_used(node.typ)
 	f.expr(node.expr)
 	if node.has_arg {
 		f.write(', ')
@@ -2251,7 +2197,7 @@ pub fn (mut f Fmt) chan_init(mut node ast.ChanInit) {
 	if is_mut {
 		f.write('mut ')
 	}
-	f.write(f.table.type_to_str_using_aliases(el_typ, f.mod2alias))
+	f.write(f.type_to_str_using_aliases(el_typ, f.mod2alias))
 	f.write('{')
 	if node.has_cap {
 		f.write('cap: ')
@@ -2370,7 +2316,6 @@ pub fn (mut f Fmt) dump_expr(node ast.DumpExpr) {
 pub fn (mut f Fmt) enum_val(node ast.EnumVal) {
 	name := f.short_module(node.enum_name)
 	f.write(name + '.' + node.val)
-	f.mark_import_as_used(name)
 }
 
 pub fn (mut f Fmt) ident(node ast.Ident) {
@@ -2414,13 +2359,12 @@ pub fn (mut f Fmt) ident(node ast.Ident) {
 		if node.name.contains('__static__') {
 			f.write_static_method(node.name, name)
 		} else {
-			f.mark_import_as_used(name)
 			f.write(name)
 		}
 		if node.concrete_types.len > 0 {
 			f.write('[')
 			for i, concrete_type in node.concrete_types {
-				typ_name := f.table.type_to_str_using_aliases(concrete_type, f.mod2alias)
+				typ_name := f.type_to_str_using_aliases(concrete_type, f.mod2alias)
 				f.write(typ_name)
 				if i != node.concrete_types.len - 1 {
 					f.write(', ')
@@ -2433,7 +2377,6 @@ pub fn (mut f Fmt) ident(node ast.Ident) {
 		} else if node.or_expr.kind == .block {
 			f.or_expr(node.or_expr)
 		}
-		f.mark_import_as_used(name)
 	}
 }
 
@@ -2449,6 +2392,7 @@ pub fn (mut f Fmt) if_expr(node ast.IfExpr) {
 	start_len := f.line_len
 	for {
 		for i, branch in node.branches {
+			f.branch_processed_imports.clear()
 			mut sum_len := 0
 			if i > 0 {
 				// `else`, close previous branch
@@ -2791,11 +2735,7 @@ pub fn (mut f Fmt) lock_expr(node ast.LockExpr) {
 pub fn (mut f Fmt) map_init(node ast.MapInit) {
 	if node.keys.len == 0 && !node.has_update_expr {
 		if node.typ > ast.void_type {
-			sym := f.table.sym(node.typ)
-			info := sym.info as ast.Map
-			f.mark_types_import_as_used(info.key_type)
-			f.mark_types_import_as_used(info.value_type)
-			f.write(f.table.type_to_str_using_aliases(node.typ, f.mod2alias))
+			f.write(f.type_to_str_using_aliases(node.typ, f.mod2alias))
 		}
 		if node.pos.line_nr == node.pos.last_line {
 			f.write('{}')
@@ -2928,8 +2868,7 @@ pub fn (mut f Fmt) match_expr(node ast.MatchExpr) {
 }
 
 pub fn (mut f Fmt) offset_of(node ast.OffsetOf) {
-	f.write('__offsetof(${f.table.type_to_str_using_aliases(node.struct_type, f.mod2alias)}, ${node.field})')
-	f.mark_types_import_as_used(node.struct_type)
+	f.write('__offsetof(${f.type_to_str_using_aliases(node.struct_type, f.mod2alias)}, ${node.field})')
 }
 
 pub fn (mut f Fmt) or_expr(node ast.OrExpr) {
@@ -3093,13 +3032,13 @@ pub fn (mut f Fmt) size_of(node ast.SizeOf) {
 	if node.is_type && !node.guessed_type {
 		// the new form was explicitly written in the source code; keep it:
 		f.write('[')
-		f.write(f.table.type_to_str_using_aliases(node.typ, f.mod2alias))
+		f.write(f.type_to_str_using_aliases(node.typ, f.mod2alias))
 		f.write(']()')
 		return
 	}
 	if node.is_type {
 		f.write('(')
-		f.write(f.table.type_to_str_using_aliases(node.typ, f.mod2alias))
+		f.write(f.type_to_str_using_aliases(node.typ, f.mod2alias))
 		f.write(')')
 	} else {
 		f.write('(')
@@ -3113,13 +3052,13 @@ pub fn (mut f Fmt) is_ref_type(node ast.IsRefType) {
 	if node.is_type && !node.guessed_type {
 		// the new form was explicitly written in the source code; keep it:
 		f.write('[')
-		f.write(f.table.type_to_str_using_aliases(node.typ, f.mod2alias))
+		f.write(f.type_to_str_using_aliases(node.typ, f.mod2alias))
 		f.write(']()')
 		return
 	}
 	if node.is_type {
 		f.write('(')
-		f.write(f.table.type_to_str_using_aliases(node.typ, f.mod2alias))
+		f.write(f.type_to_str_using_aliases(node.typ, f.mod2alias))
 		f.write(')')
 	} else {
 		f.write('(')
@@ -3272,8 +3211,7 @@ pub fn (mut f Fmt) string_inter_literal(node ast.StringInterLiteral) {
 
 pub fn (mut f Fmt) type_expr(node ast.TypeNode) {
 	if node.stmt == ast.empty_stmt {
-		f.mark_types_import_as_used(node.typ)
-		f.write(f.table.type_to_str_using_aliases(node.typ, f.mod2alias))
+		f.write(f.type_to_str_using_aliases(node.typ, f.mod2alias))
 	} else {
 		f.struct_decl(ast.StructDecl{ fields: (node.stmt as ast.StructDecl).fields },
 			true)
@@ -3284,7 +3222,7 @@ pub fn (mut f Fmt) type_of(node ast.TypeOf) {
 	f.write('typeof')
 	if node.is_type {
 		f.write('[')
-		f.write(f.table.type_to_str_using_aliases(node.typ, f.mod2alias))
+		f.write(f.type_to_str_using_aliases(node.typ, f.mod2alias))
 		f.write(']()')
 	} else {
 		f.write('(')

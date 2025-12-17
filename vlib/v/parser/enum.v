@@ -48,6 +48,11 @@ fn (mut p Parser) enum_decl() ast.EnumDecl {
 	}
 	p.check(.key_enum)
 	end_pos := p.tok.pos()
+	mut comments_before_key_enum := if p.pref.is_vls {
+		p.cur_comments.clone()
+	} else {
+		[]
+	}
 	if p.disallow_declarations_in_script_mode() {
 		return ast.EnumDecl{}
 	}
@@ -61,7 +66,7 @@ fn (mut p Parser) enum_decl() ast.EnumDecl {
 			end_pos)
 		return ast.EnumDecl{}
 	}
-	if enum_name in p.imported_symbols {
+	if p.is_imported_symbol(enum_name) {
 		p.error_with_pos('cannot register enum `${enum_name}`, this type was already imported',
 			end_pos)
 		return ast.EnumDecl{}
@@ -96,7 +101,10 @@ fn (mut p Parser) enum_decl() ast.EnumDecl {
 		// p.warn('enum val $val')
 		if p.tok.kind == .assign {
 			p.next()
+			old_assign_rhs := p.inside_assign_rhs
+			p.inside_assign_rhs = true
 			expr = p.expr(0)
+			p.inside_assign_rhs = old_assign_rhs
 			has_expr = true
 			uses_exprs = true
 		}
@@ -225,7 +233,8 @@ fn (mut p Parser) enum_decl() ast.EnumDecl {
 		is_pub: is_pub
 	})
 
-	if idx in [ast.string_type_idx, ast.rune_type_idx, ast.array_type_idx, ast.map_type_idx] {
+	if idx in [ast.string_type_idx, ast.rune_type_idx, ast.array_type_idx, ast.map_type_idx]
+		&& !p.pref.is_fmt {
 		p.error_with_pos('cannot register enum `${name}`, another type with this name exists',
 			end_pos)
 	}
@@ -249,6 +258,43 @@ fn (mut p Parser) enum_decl() ast.EnumDecl {
 
 	if !already_exists {
 		p.table.register_enum_decl(enum_decl)
+		if p.pref.is_vls {
+			key := 'enum_${name}'
+			mut has_decl_end_comment := false
+			if enum_decl.comments.len > 0
+				&& enum_decl.comments[0].pos.line_nr == enum_decl.pos.line_nr {
+				// enum MyEnum { // MyEnum end_comment1
+				comments_before_key_enum << enum_decl.comments[0]
+				has_decl_end_comment = true
+			}
+			val := ast.VlsInfo{
+				pos: typ_pos
+				doc: p.keyword_comments_to_string(enum_name, comments_before_key_enum)
+			}
+			p.table.register_vls_info(key, val)
+			for i, f in fields {
+				f_key := 'enum_${name}.${f.name}'
+				f_val := if i == 0 {
+					first_field_pre_comment := if has_decl_end_comment {
+						enum_decl.comments[1..].clone()
+					} else {
+						enum_decl.comments
+					}
+					ast.VlsInfo{
+						pos: f.pos
+						doc: p.comments_to_string(first_field_pre_comment) +
+							p.comments_to_string(f.comments)
+					}
+				} else {
+					ast.VlsInfo{
+						pos: f.pos
+						doc: p.comments_to_string(fields[i - 1].next_comments) +
+							p.comments_to_string(f.comments)
+					}
+				}
+				p.table.register_vls_info(f_key, f_val)
+			}
+		}
 	}
 	return enum_decl
 }

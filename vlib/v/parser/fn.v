@@ -52,7 +52,7 @@ fn (mut p Parser) call_expr(language ast.Language, mod string) ast.CallExpr {
 	}
 	p.check(.lpar)
 	args := p.call_args()
-	if p.tok.kind != .rpar {
+	if p.tok.kind != .rpar && !p.pref.is_vls {
 		params := p.table.fns[fn_name] or { unsafe { p.table.fns['${p.mod}.${fn_name}'] } }.params
 		if args.len < params.len && p.prev_tok.kind != .comma {
 			pos := if p.tok.kind == .eof { p.prev_tok.pos() } else { p.tok.pos() }
@@ -61,7 +61,7 @@ fn (mut p Parser) call_expr(language ast.Language, mod string) ast.CallExpr {
 			ok_arg_pos := (args[params.len - 1] or { args[0] }).pos
 			pos := token.Pos{
 				...ok_arg_pos
-				col: ok_arg_pos.col + ok_arg_pos.len
+				col: u16(ok_arg_pos.col + ok_arg_pos.len)
 			}
 			p.unexpected_with_pos(pos.extend(p.tok.pos()), expecting: '`)`')
 		} else {
@@ -70,11 +70,13 @@ fn (mut p Parser) call_expr(language ast.Language, mod string) ast.CallExpr {
 		}
 	}
 	last_pos := p.tok.pos()
-	p.next()
+	if p.tok.kind == .rpar {
+		p.next()
+	}
 	mut pos := first_pos.extend(last_pos)
 	mut or_stmts := []ast.Stmt{} // TODO: remove unnecessary allocations by just using .absent
 	mut or_pos := p.tok.pos()
-	mut or_scope := &ast.Scope(unsafe { nil })
+	mut or_scope := ast.empty_scope
 	if p.tok.kind == .key_orelse {
 		// `foo() or {}``
 		or_kind = .block
@@ -88,10 +90,14 @@ fn (mut p Parser) call_expr(language ast.Language, mod string) ast.CallExpr {
 			p.error_with_pos('error propagation not allowed inside `defer` blocks', p.prev_tok.pos())
 		}
 		or_kind = if is_not { .propagate_result } else { .propagate_option }
+		or_scope = p.scope
 	}
-	if fn_name in p.imported_symbols {
+	if p.is_imported_symbol(fn_name) {
+		check := !p.imported_symbols_used[fn_name]
 		fn_name = p.imported_symbols[fn_name]
-		p.register_used_import_for_symbol_name(fn_name)
+		if check {
+			p.register_used_import_for_symbol_name(fn_name)
+		}
 	}
 	comments := p.eat_comments(same_line: true)
 	pos.update_last_line(p.prev_tok.line_nr)
@@ -148,6 +154,13 @@ fn (mut p Parser) call_args() []ast.CallArg {
 			expr = p.struct_init('void_type', .short_syntax, false)
 		} else {
 			expr = p.expr(0)
+			if mut expr is ast.Ident {
+				if p.is_imported_symbol(expr.name) && !p.imported_symbols_used[expr.name] {
+					// func call arg is another function call
+					// import term { bright_cyan, colorize } ... colorize(bright_cyan, 'hello')
+					p.register_used_import_for_symbol_name(p.imported_symbols[expr.name])
+				}
+			}
 		}
 		if array_decompose {
 			expr = ast.ArrayDecompose{
@@ -203,6 +216,8 @@ fn (mut p Parser) fn_decl() ast.FnDecl {
 	mut is_c2v_variadic := false
 	mut is_c_extern := false
 	mut is_markused := false
+	mut is_ignore_overflow := false
+	mut is_weak := false
 	mut is_expand_simple_interpolation := false
 	mut comments := []ast.Comment{}
 	fn_attrs := p.attrs
@@ -244,11 +259,17 @@ fn (mut p Parser) fn_decl() ast.FnDecl {
 			'c2v_variadic' {
 				is_c2v_variadic = true
 			}
+			'weak' {
+				is_weak = true
+			}
 			'use_new' {
 				is_ctor_new = true
 			}
 			'markused' {
 				is_markused = true
+			}
+			'ignore_overflow' {
+				is_ignore_overflow = true
 			}
 			'c_extern' {
 				is_c_extern = true
@@ -283,6 +304,11 @@ fn (mut p Parser) fn_decl() ast.FnDecl {
 		p.next()
 	}
 	p.check(.key_fn)
+	mut comments_before_key_fn := if p.pref.is_vls {
+		p.cur_comments.clone()
+	} else {
+		[]
+	}
 	comments << p.eat_comments()
 	p.open_scope()
 	defer {
@@ -349,6 +375,7 @@ fn (mut p Parser) fn_decl() ast.FnDecl {
 			check_name = if language == .js { p.check_js_name() } else { p.check_name() }
 			name = check_name
 		}
+
 		if language == .v && !p.pref.translated && !p.is_translated && !p.builtin_mod
 			&& util.contains_capital(check_name) {
 			p.error_with_pos('function names cannot contain uppercase letters, use snake_case instead',
@@ -383,7 +410,7 @@ fn (mut p Parser) fn_decl() ast.FnDecl {
 			}
 		}
 		if !p.pref.is_fmt {
-			if name in p.imported_symbols {
+			if p.is_imported_symbol(name) {
 				p.error_with_pos('cannot redefine imported function `${name}`', name_pos)
 				return ast.FnDecl{
 					scope: unsafe { nil }
@@ -446,10 +473,19 @@ fn (mut p Parser) fn_decl() ast.FnDecl {
 			}
 		}
 	}
+	if generic_names.len > 0 {
+		for fna in fn_attrs {
+			if fna.name == 'export' {
+				p.error_with_pos('generic functions cannot be exported', fna.pos)
+				break
+			}
+		}
+	}
 	// Params
 	params_t, are_params_type_only, mut is_variadic, mut is_c_variadic := p.fn_params()
 	if is_c2v_variadic {
 		is_variadic = true
+		is_c_variadic = true
 	}
 	params << params_t
 	// Return type
@@ -645,6 +681,7 @@ run them via `v file.v` instead',
 	})
 	*/
 	// Body
+	keep_fn_name := p.cur_fn_name
 	p.cur_fn_name = name
 	mut stmts := []ast.Stmt{}
 	body_start_pos := p.tok.pos()
@@ -656,11 +693,16 @@ run them via `v file.v` instead',
 		p.inside_fn = true
 		p.inside_unsafe_fn = is_unsafe
 		p.cur_fn_scope = p.scope
-		stmts = p.parse_block_no_scope(true)
+		if p.is_vls_skip_file {
+			p.skip_scope()
+		} else {
+			stmts = p.parse_block_no_scope(true)
+		}
 		p.cur_fn_scope = last_fn_scope
 		p.inside_unsafe_fn = false
 		p.inside_fn = false
 	}
+	p.cur_fn_name = keep_fn_name
 	if !no_body && are_params_type_only {
 		p.error_with_pos('functions with type only params can not have bodies', body_start_pos)
 		return ast.FnDecl{
@@ -693,6 +735,8 @@ run them via `v file.v` instead',
 		is_unsafe:          is_unsafe
 		is_must_use:        is_must_use
 		is_markused:        is_markused
+		is_ignore_overflow: is_ignore_overflow
+		is_weak:            is_weak
 		is_file_translated: p.is_translated
 		//
 		attrs:          fn_attrs
@@ -730,6 +774,20 @@ run them via `v file.v` instead',
 		p.table.register_fn_generic_types(fn_decl.fkey())
 	}
 	p.label_names = []
+	if p.pref.is_vls {
+		type_str := if (is_method || is_static_type_method) && rec.typ != ast.no_type {
+			p.table.sym(rec.typ.idx_type()).name.all_after_last('.')
+		} else {
+			''
+		}
+		key := 'fn_${p.mod}[${type_str}]${short_fn_name}'
+		val := ast.VlsInfo{
+			pos: fn_decl.pos
+			doc: p.keyword_comments_to_string(short_fn_name, comments_before_key_fn) +
+				p.comments_to_string(fn_decl.end_comments)
+		}
+		p.table.register_vls_info(key, val)
+	}
 	return fn_decl
 }
 
@@ -990,6 +1048,10 @@ fn (mut p Parser) fn_params() ([]ast.Param, bool, bool, bool) {
 				// error is added in parse_type
 				return []ast.Param{}, false, false, false
 			}
+			if param_type == ast.chan_type {
+				p.chan_type_error()
+				return []ast.Param{}, false, false, false
+			}
 			if is_mut {
 				if !param_type.has_flag(.generic) {
 					if is_variadic {
@@ -1118,6 +1180,10 @@ fn (mut p Parser) fn_params() ([]ast.Param, bool, bool, bool) {
 			type_pos[0] = pos.extend(p.prev_tok.pos())
 			if typ == 0 {
 				// error is added in parse_type
+				return []ast.Param{}, false, false, false
+			}
+			if typ == ast.chan_type {
+				p.chan_type_error()
 				return []ast.Param{}, false, false, false
 			}
 			if is_mut {

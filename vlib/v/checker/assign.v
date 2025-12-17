@@ -149,8 +149,13 @@ fn (mut c Checker) assign_stmt(mut node ast.AssignStmt) {
 	for i, mut left in node.left {
 		if mut left is ast.CallExpr {
 			// ban `foo() = 10`
-			c.error('cannot call function `${left.name}()` on the left side of an assignment',
-				left.pos)
+			if c.pref.is_vls {
+				// in `vls` mode, code is incomplete, eval left also
+				c.expr(mut left)
+			} else {
+				c.error('cannot call function `${left.name}()` on the left side of an assignment',
+					left.pos)
+			}
 		} else if mut left is ast.PrefixExpr {
 			// ban `*foo() = 10`
 			if left.right is ast.CallExpr && left.op == .mul {
@@ -202,7 +207,7 @@ fn (mut c Checker) assign_stmt(mut node ast.AssignStmt) {
 			mut expr := node.right[i]
 			if left is ast.Ident && left.is_mut() && expr is ast.StructInit && expr.is_anon {
 				c.anon_struct_should_be_mut = true
-				defer {
+				defer(fn) {
 					c.anon_struct_should_be_mut = false
 				}
 			}
@@ -444,6 +449,7 @@ fn (mut c Checker) assign_stmt(mut node ast.AssignStmt) {
 						if c.check_import_sym_conflict(left.name) {
 							c.error('duplicate of an import symbol `${left.name}`', left.pos)
 						}
+						c.check_module_name_conflict(left.name, left.pos)
 					}
 					if node.op == .assign && left_type.has_flag(.option) && right is ast.UnsafeExpr
 						&& right.expr.is_nil() {
@@ -503,7 +509,7 @@ fn (mut c Checker) assign_stmt(mut node ast.AssignStmt) {
 					c.error('cannot use infix expression on the left side of `${node.op}`',
 						left.pos)
 				}
-				if is_decl {
+				if is_decl && !c.pref.is_vls {
 					c.error('non-name `${left}` on left side of `:=`', left.pos())
 				}
 
@@ -643,7 +649,8 @@ or use an explicit `unsafe{ a[..] }`, if you do not want a copy of the slice.',
 				}
 			}
 			right_is_ptr := right_type.is_any_kind_of_pointer()
-			if !right_is_ptr && node.op == .assign && right_type_unwrapped.is_number() {
+			if !left_type.has_flag(.shared_f) && !right_is_ptr && node.op == .assign
+				&& right_type_unwrapped.is_number() {
 				c.error('cannot assign to `${left}`: ' +
 					c.expected_msg(right_type_unwrapped, left_type_unwrapped), right.pos())
 			}
@@ -661,8 +668,13 @@ or use an explicit `unsafe{ a[..] }`, if you do not want a copy of the slice.',
 			}
 		}
 		if mut left is ast.Ident && left.info is ast.IdentVar {
-			if left.info.is_static && right_sym.kind == .map {
-				c.error('maps cannot be static', left.pos)
+			if left.info.is_static {
+				if right_sym.kind == .map {
+					c.error('maps cannot be static', left.pos)
+				} else if !right.is_constant() {
+					c.error('cannot initialized static variable with non-constant value',
+						left.pos)
+				}
 			}
 		}
 		// Single side check
@@ -740,14 +752,14 @@ or use an explicit `unsafe{ a[..] }`, if you do not want a copy of the slice.',
 				} else if left_type.is_unsigned() {
 					left_type
 				} else {
-					// signed types' idx adds with 5 will get correct relative unsigned type
-					// i8 		=> byte
-					// i16 		=> u16
-					// int  	=> u32
-					// i64  	=> u64
-					// isize	=> usize
-					// i128 	=> u128 NOT IMPLEMENTED YET
-					ast.idx_to_type(left_type.idx() + ast.u32_type_idx - ast.int_type_idx)
+					// signed types => unsigned types
+					unsigned_type := left_type.flip_signedness()
+					if unsigned_type == ast.void_type {
+						c.error('invalid operation: shift on type `${c.table.sym(left_type).name}`',
+							node.pos)
+						ast.void_type
+					}
+					unsigned_type
 				}
 
 				node = ast.AssignStmt{
@@ -996,6 +1008,9 @@ fn (mut c Checker) change_flags_if_comptime_expr(mut left ast.Ident, right ast.E
 				if ctyp != ast.void_type {
 					left.obj.ct_type_var = right_obj_var.ct_type_var
 					left.obj.typ = ctyp
+					if ctyp.has_flag(.generic) && c.unwrap_generic(ctyp).has_flag(.option) {
+						left.obj.typ = left.obj.typ.set_flag(.option)
+					}
 				}
 			}
 		} else if right is ast.DumpExpr && right.expr is ast.ComptimeSelector {

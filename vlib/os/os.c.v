@@ -5,6 +5,10 @@ import strings
 #include <sys/stat.h> // #include <signal.h>
 #include <errno.h>
 
+$if macos {
+	#include <libproc.h>
+}
+
 $if freebsd || openbsd {
 	#include <sys/sysctl.h>
 }
@@ -227,29 +231,48 @@ pub fn rename(src string, dst string) ! {
 	}
 }
 
-// cp copies files or folders from `src` to `dst`.
-pub fn cp(src string, dst string) ! {
+@[params]
+pub struct CopyParams {
+pub:
+	fail_if_exists bool
+}
+
+// cp copies the file src to the file or directory dst. If dst specifies a directory, the file will be copied into dst
+// using the base filename from src. If dst specifies a file that already exists, it will be replaced by
+// default. Can be overridden to fail by setting fail_if_exists: true
+pub fn cp(src string, dst string, config CopyParams) ! {
 	$if windows {
 		w_src := src.replace('/', '\\')
-		w_dst := dst.replace('/', '\\')
-		if C.CopyFile(w_src.to_wide(), w_dst.to_wide(), false) == 0 {
+		mut w_dst := dst.replace('/', '\\')
+		if is_dir(w_dst) {
+			w_dst = join_path_single(w_dst, file_name(w_src))
+		}
+		if C.CopyFile(w_src.to_wide(), w_dst.to_wide(), config.fail_if_exists) == 0 {
 			// we must save error immediately, or it will be overwritten by other API function calls.
 			code := int(C.GetLastError())
 			return error_win32(
-				msg:  'failed to copy ${src} to ${dst}'
+				msg:  'cp: failed to copy ${src} to ${dst}'
 				code: code
 			)
 		}
 	} $else {
+		mut w_dst := dst
+		if is_dir(dst) {
+			w_dst = join_path_single(w_dst, file_name(src))
+		}
 		fp_from := C.open(&char(src.str), C.O_RDONLY, 0)
 		if fp_from < 0 { // Check if file opened
-			return error_with_code('cp: failed to open ${src}', int(fp_from))
+			return error_with_code('cp: failed to open ${src} for reading', int(fp_from))
 		}
-		fp_to := C.open(&char(dst.str), C.O_WRONLY | C.O_CREAT | C.O_TRUNC, C.S_IWUSR | C.S_IRUSR)
+		mode_flags := C.S_IWUSR | C.S_IRUSR
+		mut open_flags := C.O_WRONLY | C.O_CREAT | C.O_TRUNC
+		if config.fail_if_exists {
+			open_flags |= C.O_EXCL
+		}
+		fp_to := C.open(&char(w_dst.str), open_flags, mode_flags)
 		if fp_to < 0 { // Check if file opened (permissions problems ...)
 			C.close(fp_from)
-			return error_with_code('cp (permission): failed to write to ${dst} (fp_to: ${fp_to})',
-				int(fp_to))
+			return error_with_code('cp: failed to open ${w_dst} for writing', int(fp_to))
 		}
 		// TODO: use defer{} to close files in case of error or return.
 		// Currently there is a C-Error when building.
@@ -263,14 +286,14 @@ pub fn cp(src string, dst string) ! {
 			if C.write(fp_to, &buf[0], count) < 0 {
 				C.close(fp_to)
 				C.close(fp_from)
-				return error_with_code('cp: failed to write to ${dst}', int(-1))
+				return error_with_code('cp: failed to write to ${w_dst}', int(-1))
 			}
 		}
 		from_attr := stat(src)!
-		if C.chmod(&char(dst.str), from_attr.mode) < 0 {
+		if C.chmod(&char(w_dst.str), from_attr.mode) < 0 {
 			C.close(fp_to)
 			C.close(fp_from)
-			return error_with_code('failed to set permissions for ${dst}', int(-1))
+			return error_with_code('failed to set permissions for ${w_dst}', int(-1))
 		}
 		C.close(fp_to)
 		C.close(fp_from)
@@ -429,7 +452,12 @@ pub fn is_executable(path string) bool {
 		// 04 Read-only
 		// 06 Read and write
 		p := real_path(path)
-		return exists(p) && (p.ends_with('.exe') || p.ends_with('.bat') || p.ends_with('.cmd'))
+		if !exists(p) {
+			return false
+		}
+		ext := p.to_lower().all_after_last('.')
+		// Note: Extensions like 'ps1', 'vbs', 'js', 'msi', 'scr', 'pif' require specific interpreters and are not directly executable
+		return ext in ['exe', 'com', 'bat', 'cmd']
 	}
 	$if solaris {
 		attr := stat(path) or { return false }
@@ -696,7 +724,7 @@ pub fn executable() string {
 				// https://docs.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfinalpathnamebyhandlew
 				final_len := C.GetFinalPathNameByHandleW(file, unsafe { &u16(&final_path[0]) },
 					max_path_buffer_size, 0)
-				if final_len < u32(max_path_buffer_size) {
+				if final_len < u32(max_path_buffer_size) && final_len != 0 {
 					sret := unsafe { string_from_wide2(&u16(&final_path[0]), int(final_len)) }
 					defer {
 						unsafe { sret.free() }
@@ -705,7 +733,7 @@ pub fn executable() string {
 					sret_slice := sret[4..]
 					res := sret_slice.clone()
 					return res
-				} else {
+				} else if final_len != 0 {
 					eprintln('os.executable() saw that the executable file path was too long')
 				}
 			}
@@ -715,7 +743,7 @@ pub fn executable() string {
 	}
 	$if macos {
 		pid := C.getpid()
-		ret := proc_pidpath(pid, &result[0], max_path_len)
+		ret := C.proc_pidpath(pid, &result[0], max_path_len)
 		if ret <= 0 {
 			eprintln('os.executable() failed at calling proc_pidpath with pid: ${pid} . proc_pidpath returned ${ret} ')
 			return executable_fallback()
@@ -744,7 +772,7 @@ pub fn executable() string {
 		if unsafe { C.sysctl(&mib[0], mib.len, C.NULL, &bufsize, C.NULL, 0) } == 0 {
 			if bufsize > max_path_buffer_size {
 				pbuf = unsafe { &&u8(malloc(int(bufsize))) }
-				defer {
+				defer(fn) {
 					unsafe { free(pbuf) }
 				}
 			}
@@ -847,19 +875,19 @@ pub fn real_path(fpath string) string {
 		}
 		file := C.CreateFile(fpath_wide, 0x80000000, 1, 0, 3, 0x80, 0)
 		if file != voidptr(-1) {
-			defer {
-				C.CloseHandle(file)
-			}
+			defer { C.CloseHandle(file) }
 			// https://docs.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfinalpathnamebyhandlew
 			final_len := C.GetFinalPathNameByHandleW(file, pu16_fullpath, max_path_buffer_size,
 				0)
-			if final_len < u32(max_path_buffer_size) {
+			if final_len < u32(max_path_buffer_size) && final_len != 0 {
 				rt := unsafe { string_from_wide2(pu16_fullpath, int(final_len)) }
 				srt := rt[4..]
 				unsafe { res.free() }
 				res = srt.clone()
 			} else {
-				eprintln('os.real_path() saw that the file path was too long')
+				if final_len != 0 {
+					eprintln('os.real_path() saw that the file path was too long')
+				}
 				unsafe { res.free() }
 				return fpath.clone()
 			}

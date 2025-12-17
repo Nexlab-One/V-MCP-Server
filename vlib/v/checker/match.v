@@ -14,17 +14,21 @@ fn (mut c Checker) match_expr(mut node ast.MatchExpr) ast.Type {
 	}
 	if node.is_expr {
 		c.expected_expr_type = c.expected_type
-		defer {
+		defer(fn) {
 			c.expected_expr_type = ast.void_type
 		}
 	}
 	mut cond_type := ast.void_type
 	if node.is_comptime {
-		// for field.name and generic type `T`
-		if node.cond is ast.SelectorExpr {
-			c.expr(mut node.cond)
+		if node.cond is ast.AtExpr {
+			cond_type = c.expr(mut node.cond)
+		} else {
+			// for field.name and generic type `T`
+			if node.cond is ast.SelectorExpr {
+				c.expr(mut node.cond)
+			}
+			cond_type = c.get_expr_type(node.cond)
 		}
-		cond_type = c.get_expr_type(node.cond)
 	} else {
 		cond_type = c.expr(mut node.cond)
 	}
@@ -69,7 +73,7 @@ fn (mut c Checker) match_expr(mut node ast.MatchExpr) ast.Type {
 			c.expr(mut node.cond)
 			if !c.type_resolver.is_generic_param_var(node.cond) {
 				match mut node.cond {
-					ast.StringLiteral {
+					ast.StringLiteral, ast.AtExpr {
 						comptime_match_cond_value = node.cond.val
 					}
 					ast.IntegerLiteral {
@@ -104,6 +108,10 @@ fn (mut c Checker) match_expr(mut node ast.MatchExpr) ast.Type {
 						if c.comptime.inside_comptime_for && node.cond.field_name in ['name', 'typ'] {
 							// hack: `typ` is just for bypass the error test, because we don't know it is a type match or a value match righ now
 							comptime_match_cond_value = c.comptime.comptime_for_field_value.name
+						} else if mut node.cond.expr is ast.Ident
+							&& node.cond.gkind_field in [.typ, .unaliased_typ] {
+							left_type := c.get_expr_type(node.cond.expr)
+							comptime_match_cond_value = c.table.type_to_str(left_type)
 						} else {
 							c.error('`${node.cond}` is not `\$for` field.name.', node.cond.pos)
 							return ast.void_type
@@ -122,9 +130,17 @@ fn (mut c Checker) match_expr(mut node ast.MatchExpr) ast.Type {
 		if node.is_comptime {
 			// `idx_str` is composed of two parts:
 			// The first part represents the current context of the branch statement, `comptime_branch_context_str`, formatted like `T=int,X=string,method.name=json`
-			// The second part indicates the branch's location in the source file.
+			// The second part is the branch's id.
 			// This format must match what is in `cgen`.
-			idx_str := comptime_branch_context_str + '|${c.file.path}|${branch.pos}|'
+			if branch.id == 0 {
+				// this is a new branch, alloc a new id for it
+				c.cur_ct_id++
+				branch.id = c.cur_ct_id
+			}
+			mut idx_str := comptime_branch_context_str + '|id=${branch.id}|'
+			if c.comptime.inside_comptime_for && c.comptime.comptime_for_field_var != '' {
+				idx_str += '|field_type=${c.comptime.comptime_for_field_type}|'
+			}
 			mut c_str := ''
 			if !branch.is_else {
 				if c.inside_x_matches_type {
@@ -137,10 +153,18 @@ fn (mut c Checker) match_expr(mut node ast.MatchExpr) ast.Type {
 								node.cond)
 							c_str = '${expr} == ${c.table.type_to_str(branch_type)}'
 						} else {
-							// $match a { $int {}
-							comptime_match_branch_result = c.check_compatible_types(node.cond_type,
-								'${node.cond}', expr)
-							c_str = '${c.table.type_to_str(node.cond_type)} == ${expr}'
+							is_function := c.table.final_sym(node.cond_type).kind == .function
+							if !is_function {
+								// $match a { $int {}
+								comptime_match_branch_result = c.check_compatible_types(node.cond_type,
+									'${node.cond}', expr)
+								c_str = '${c.table.type_to_str(node.cond_type)} == ${expr}'
+							} else {
+								// $match T { FnType {} }
+								branch_type := c.get_expr_type(expr)
+								comptime_match_branch_result = c.table.type_to_str(node.cond_type) == c.table.type_to_str(branch_type)
+								c_str = '${comptime_match_branch_result} == true'
+							}
 						}
 						if comptime_match_branch_result {
 							break
@@ -213,10 +237,37 @@ fn (mut c Checker) match_expr(mut node ast.MatchExpr) ast.Type {
 				}
 			}
 		}
-		if node.is_expr {
-			c.stmts_ending_with_expression(mut branch.stmts, c.expected_or_type)
-		} else {
-			c.stmts(mut branch.stmts)
+
+		for mut expr in branch.exprs {
+			// (expr) => expr
+			expr = expr.remove_par()
+		}
+
+		if !c.pref.translated && !c.file.is_translated {
+			// check for always true/false match branch
+			for mut expr in branch.exprs {
+				mut check_expr := ast.InfixExpr{
+					op:    .eq
+					left:  node.cond
+					right: expr
+				}
+				t_expr := c.checker_transformer.expr(mut check_expr)
+				if t_expr is ast.BoolLiteral {
+					if t_expr.val {
+						c.note('match is always true', expr.pos())
+					} else {
+						c.note('match is always false', expr.pos())
+					}
+				}
+			}
+		}
+
+		if !node.is_comptime || (node.is_comptime && comptime_match_branch_result) {
+			if node.is_expr {
+				c.stmts_ending_with_expression(mut branch.stmts, c.expected_or_type)
+			} else {
+				c.stmts(mut branch.stmts)
+			}
 		}
 		c.smartcast_mut_pos = token.Pos{}
 		c.smartcast_cond_pos = token.Pos{}
@@ -242,11 +293,17 @@ fn (mut c Checker) match_expr(mut node ast.MatchExpr) ast.Type {
 				} else {
 					node.expected_type
 				}
-				expr_type := c.unwrap_generic(if stmt.expr is ast.CallExpr {
-					stmt.typ
+				branch.is_comptime_err = stmt.expr is ast.ComptimeCall
+					&& stmt.expr.kind in [.compile_error, .compile_warn]
+				expr_type := if branch.is_comptime_err {
+					c.expected_type
 				} else {
-					c.expr(mut stmt.expr)
-				})
+					c.unwrap_generic(if stmt.expr is ast.CallExpr {
+						stmt.typ
+					} else {
+						c.expr(mut stmt.expr)
+					})
+				}
 				unwrapped_expected_type := c.unwrap_generic(node.expected_type)
 				must_be_option = must_be_option || expr_type == ast.none_type
 				stmt.typ = expr_type
@@ -371,9 +428,20 @@ fn (mut c Checker) match_expr(mut node ast.MatchExpr) ast.Type {
 											needs_explicit_cast = true
 										}
 									}
-									.i32, .int {
+									.i32 {
 										if !(num >= min_i32 && num <= max_i32) {
 											needs_explicit_cast = true
+										}
+									}
+									.int {
+										$if new_int ? && x64 {
+											if !(num >= min_i64 && num <= max_i64) {
+												needs_explicit_cast = true
+											}
+										} $else {
+											if !(num >= min_i32 && num <= max_i32) {
+												needs_explicit_cast = true
+											}
 										}
 									}
 									.i64 {
@@ -399,14 +467,25 @@ fn (mut c Checker) match_expr(mut node ast.MatchExpr) ast.Type {
 					c.error('`match` expression requires an expression as the last statement of every branch',
 						stmt.pos)
 				}
+			} else if c.inside_return && mut stmt is ast.Return && ret_type == ast.void_type {
+				ret_type = if stmt.types.len > 0 { stmt.types[0] } else { c.expected_type }
 			}
 		}
 		first_iteration = false
-		if has_return := c.has_return(branch.stmts) {
-			if has_return {
+		if node.is_comptime {
+			// branches may not have been processed by c.stmts()
+			if has_top_return(branch.stmts) {
 				nbranches_with_return++
 			} else {
 				nbranches_without_return++
+			}
+		} else {
+			if has_return := c.has_return(branch.stmts) {
+				if has_return {
+					nbranches_with_return++
+				} else {
+					nbranches_without_return++
+				}
 			}
 		}
 	}

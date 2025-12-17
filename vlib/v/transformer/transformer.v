@@ -1,3 +1,6 @@
+// Copyright (c) 2019-2025 Alexander Medvednikov. All rights reserved.
+// Use of this source code is governed by an MIT license
+// that can be found in the LICENSE file.
 module transformer
 
 import v.pref
@@ -13,6 +16,7 @@ pub mut:
 mut:
 	is_assert   bool
 	inside_dump bool
+	inside_in   bool
 	//
 	strings_builder_type ast.Type = ast.no_type
 }
@@ -51,38 +55,6 @@ pub fn (mut t Transformer) transform(mut ast_file ast.File) {
 	t.file = ast_file
 	for mut stmt in ast_file.stmts {
 		stmt = t.stmt(mut stmt)
-	}
-}
-
-pub fn (mut t Transformer) find_new_array_len(node ast.AssignStmt) {
-	if !t.pref.is_prod {
-		return
-	}
-	// looking for, array := []type{len:int}
-	mut right := node.right[0]
-	if mut right is ast.ArrayInit {
-		mut left := node.left[0]
-		if mut left is ast.Ident {
-			// we can not analyse mut array
-			if left.is_mut {
-				t.index.safe_access(left.name, -2)
-				return
-			}
-			// as we do not need to check any value under the setup len
-			if !right.has_len {
-				t.index.safe_access(left.name, -1)
-				return
-			}
-
-			mut len := int(0)
-
-			value := right.len_expr
-			if value is ast.IntegerLiteral {
-				len = value.val.int() + 1
-			}
-
-			t.index.safe_access(left.name, len)
-		}
 	}
 }
 
@@ -293,7 +265,9 @@ pub fn (mut t Transformer) stmt(mut node ast.Stmt) ast.Stmt {
 		}
 		ast.Import {}
 		ast.InterfaceDecl {
-			return t.interface_decl(mut node)
+			for mut field in node.fields {
+				field.default_expr = t.expr(mut field.default_expr)
+			}
 		}
 		ast.Module {}
 		ast.Return {
@@ -534,14 +508,6 @@ pub fn (mut t Transformer) for_stmt(mut node ast.ForStmt) ast.Stmt {
 	return node
 }
 
-pub fn (mut t Transformer) interface_decl(mut node ast.InterfaceDecl) ast.Stmt {
-	for mut field in node.fields {
-		field.default_expr = t.expr(mut field.default_expr)
-	}
-
-	return node
-}
-
 pub fn (mut t Transformer) expr(mut node ast.Expr) ast.Expr {
 	if t.inside_dump {
 		return node
@@ -554,12 +520,7 @@ pub fn (mut t Transformer) expr(mut node ast.Expr) ast.Expr {
 			node.expr = t.expr(mut node.expr)
 		}
 		ast.ArrayInit {
-			for mut expr in node.exprs {
-				expr = t.expr(mut expr)
-			}
-			node.len_expr = t.expr(mut node.len_expr)
-			node.cap_expr = t.expr(mut node.cap_expr)
-			node.init_expr = t.expr(mut node.init_expr)
+			return t.array_init(mut node)
 		}
 		ast.AsCast {
 			node.expr = t.expr(mut node.expr)
@@ -650,7 +611,18 @@ pub fn (mut t Transformer) expr(mut node ast.Expr) ast.Expr {
 			}
 		}
 		ast.ParExpr {
-			node.expr = t.expr(mut node.expr)
+			mut inner_expr := t.expr(mut node.expr)
+			if inner_expr in [
+				ast.IntegerLiteral,
+				ast.FloatLiteral,
+				ast.BoolLiteral,
+				ast.StringLiteral,
+				ast.StringInterLiteral,
+				ast.CharLiteral,
+				ast.Ident,
+			] {
+				return inner_expr
+			}
 		}
 		ast.PostfixExpr {
 			node.expr = t.expr(mut node.expr)
@@ -762,8 +734,16 @@ fn (mut t Transformer) trans_const_value_to_literal(mut expr ast.Expr) {
 }
 
 pub fn (mut t Transformer) infix_expr(mut node ast.InfixExpr) ast.Expr {
-	node.left = t.expr(mut node.left)
-	node.right = t.expr(mut node.right)
+	if node.op == .not_in || node.op == .key_in {
+		tmp_inside_in := t.inside_in
+		t.inside_in = true
+		node.left = t.expr(mut node.left)
+		node.right = t.expr(mut node.right)
+		t.inside_in = tmp_inside_in
+	} else {
+		node.left = t.expr(mut node.left)
+		node.right = t.expr(mut node.right)
+	}
 	if !t.pref.translated {
 		t.trans_const_value_to_literal(mut node.left)
 		t.trans_const_value_to_literal(mut node.right)
@@ -1013,7 +993,130 @@ pub fn (mut t Transformer) infix_expr(mut node ast.InfixExpr) ast.Expr {
 					else {}
 				}
 			}
-			else {}
+			ast.CharLiteral {
+				match mut node.right {
+					ast.CharLiteral {
+						left_val := node.left.val.runes()[0]
+						right_val := node.right.val.runes()[0]
+
+						match node.op {
+							.eq {
+								return ast.BoolLiteral{
+									val: left_val == right_val
+								}
+							}
+							.ne {
+								return ast.BoolLiteral{
+									val: left_val != right_val
+								}
+							}
+							.gt {
+								return ast.BoolLiteral{
+									val: left_val > right_val
+								}
+							}
+							.ge {
+								return ast.BoolLiteral{
+									val: left_val >= right_val
+								}
+							}
+							.lt {
+								return ast.BoolLiteral{
+									val: left_val < right_val
+								}
+							}
+							.le {
+								return ast.BoolLiteral{
+									val: left_val <= right_val
+								}
+							}
+							.plus {
+								return ast.CharLiteral{
+									val: (left_val + right_val).str()
+									pos: pos
+								}
+							}
+							.mul {
+								return ast.CharLiteral{
+									val: (left_val * right_val).str()
+									pos: pos
+								}
+							}
+							.minus {
+								return ast.CharLiteral{
+									val: (left_val - right_val).str()
+									pos: pos
+								}
+							}
+							.div {
+								return ast.CharLiteral{
+									val: (left_val / right_val).str()
+									pos: pos
+								}
+							}
+							.mod {
+								return ast.CharLiteral{
+									val: (left_val % right_val).str()
+									pos: pos
+								}
+							}
+							.xor {
+								return ast.CharLiteral{
+									val: (left_val ^ right_val).str()
+									pos: pos
+								}
+							}
+							.pipe {
+								return ast.CharLiteral{
+									val: (left_val | right_val).str()
+									pos: pos
+								}
+							}
+							.amp {
+								return ast.CharLiteral{
+									val: (left_val & right_val).str()
+									pos: pos
+								}
+							}
+							.left_shift {
+								return ast.CharLiteral{
+									val: (unsafe { left_val << right_val }).str()
+									pos: pos
+								}
+							}
+							.right_shift {
+								return ast.CharLiteral{
+									val: (left_val >> right_val).str()
+									pos: pos
+								}
+							}
+							.unsigned_right_shift {
+								return ast.CharLiteral{
+									val: (u64(left_val) >>> right_val).str()
+									pos: pos
+								}
+							}
+							else {}
+						}
+					}
+					else {}
+				}
+			}
+			else {
+				// for `a == a`, `a != a`, `struct.f != struct.f`
+				// Note: can't compare `f32` or `f64` here, as `NaN != NaN` will return true in IEEE 754
+				if node.left.type_name() == node.right.type_name()
+					&& node.left_type !in [ast.f32_type, ast.f64_type] && node.op in [.eq, .ne]
+					&& node.left !is ast.StructInit && node.right !is ast.StructInit {
+					left_name := '${node.left}'
+					right_name := '${node.right}'
+					if left_name == right_name {
+						return ast.BoolLiteral{
+							val: if node.op == .eq { true } else { false }
+						}
+					}
+				}
+			}
 		}
 		return node
 	}
@@ -1168,6 +1271,11 @@ pub fn (mut t Transformer) simplify_nested_interpolation_in_sb(mut onode ast.Stm
 		return false
 	}
 	original := nexpr.args[0].expr as ast.StringInterLiteral
+	if original.exprs.len != original.expr_types.len {
+		// This should be a generic type, e.g., `${it}` where `it` is type of T
+		// first time, `T` maybe `int`, but second time, `T` maybe `string`
+		return false
+	}
 	// only very simple string interpolations, without any formatting, like the following examples
 	// can be optimised to a list of simpler string builder calls, instead of using str_intp:
 	// >> sb.write_string('abc ${num}')
@@ -1241,6 +1349,7 @@ pub fn (mut t Transformer) simplify_nested_interpolation_in_sb(mut onode ast.Stm
 	// calls << ast.node
 	unsafe {
 		*onode = ast.Stmt(ast.Block{
+			scope: ast.empty_scope
 			stmts: calls
 		})
 	}

@@ -62,7 +62,7 @@ fn (mut g Gen) autofree_scope_vars2(scope &ast.Scope, start_pos int, end_pos int
 		match obj {
 			ast.Var {
 				g.trace_autofree('// var "${obj.name}" var.pos=${obj.pos.pos} var.line_nr=${obj.pos.line_nr}')
-				if obj.name == g.returned_var_name {
+				if obj.name in g.returned_var_names {
 					g.print_autofree_var(obj, 'returned from function')
 					g.trace_autofree('// skipping returned var')
 					continue
@@ -97,6 +97,21 @@ fn (mut g Gen) autofree_scope_vars2(scope &ast.Scope, start_pos int, end_pos int
 				}
 				if obj.expr is ast.IfGuardExpr {
 					continue
+				}
+				if obj.expr is ast.UnsafeExpr && obj.expr.expr is ast.CallExpr
+					&& (obj.expr.expr as ast.CallExpr).is_method {
+					if left_var := scope.objects[obj.expr.expr.left.str()] {
+						if func := g.table.find_method(g.table.final_sym(left_var.typ),
+							obj.expr.expr.name)
+						{
+							if func.attrs.contains('reused') && left_var is ast.Var
+								&& left_var.expr is ast.CastExpr {
+								if left_var.expr.expr.is_literal() {
+									continue
+								}
+							}
+						}
+					}
 				}
 				g.autofree_variable(obj)
 			}
@@ -133,13 +148,13 @@ fn (mut g Gen) autofree_variable(v ast.Var) {
 		// eprintln('   > var name: ${v.name:-20s} | is_arg: ${v.is_arg.str():6} | var type: ${int(v.typ):8} | type_name: ${sym.name:-33s}')
 	}
 	// }
-	free_fn := g.styp(v.typ.set_nr_muls(0).clear_option_and_result()) + '_free'
+	mut free_fn := g.styp(v.typ.set_nr_muls(0).clear_option_and_result()) + '_free'
 	if sym.kind == .array {
 		if sym.has_method('free') {
 			g.autofree_var_call(free_fn, v)
 			return
 		}
-		g.autofree_var_call('array_free', v)
+		g.autofree_var_call('builtin__array_free', v)
 		return
 	}
 	if sym.kind == .string {
@@ -164,8 +179,11 @@ fn (mut g Gen) autofree_variable(v ast.Var) {
 				*/
 			}
 		}
-		g.autofree_var_call('string_free', v)
+		g.autofree_var_call('builtin__string_free', v)
 		return
+	}
+	if sym.is_builtin() {
+		free_fn = 'builtin__${free_fn}'
 	}
 	// Free user reference types
 	is_user_ref := v.typ.is_ptr() && sym.name.after('.')[0].is_capital()
@@ -246,4 +264,18 @@ fn (mut g Gen) autofree_var_call(free_fn_name string, v ast.Var) {
 		}
 	}
 	g.autofree_scope_stmts << af.str()
+}
+
+fn (mut g Gen) detect_used_var_on_return(expr ast.Expr) {
+	match expr {
+		ast.Ident {
+			g.returned_var_names[expr.name] = true
+		}
+		ast.StructInit {
+			for field_expr in expr.init_fields {
+				g.detect_used_var_on_return(field_expr.expr)
+			}
+		}
+		else {}
+	}
 }
