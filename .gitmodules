@@ -1,0 +1,3 @@
+[submodule "v-ui"]
+	path = v-ui
+	url = https://github.com/vlang/ui.git

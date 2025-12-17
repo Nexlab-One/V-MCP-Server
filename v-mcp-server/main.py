@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 class VServerConfig:
     """Configuration for the V MCP Server."""
     v_repo_path: Path
+    v_ui_path: Optional[Path] = None
     cache_ttl_seconds: int = 300  # 5 minutes default
     max_search_results: int = 50
     log_level: str = "INFO"
@@ -41,6 +42,16 @@ class VServerConfig:
             # Default to parent directory
             repo_path = Path(__file__).parent.parent
 
+        # V UI repository path (optional)
+        v_ui_path = os.getenv('V_UI_PATH')
+        if v_ui_path:
+            ui_path = Path(v_ui_path)
+        else:
+            # Default to v-ui submodule in parent directory
+            ui_path = repo_path / "v-ui"
+            if not ui_path.exists():
+                ui_path = None
+
         # Cache TTL
         cache_ttl = int(os.getenv('V_CACHE_TTL_SECONDS', '300'))
 
@@ -52,6 +63,7 @@ class VServerConfig:
 
         return cls(
             v_repo_path=repo_path,
+            v_ui_path=ui_path,
             cache_ttl_seconds=cache_ttl,
             max_search_results=max_results,
             log_level=log_level
@@ -75,6 +87,11 @@ class VDocumentationServer:
         self.docs_path = config.v_repo_path / "doc"
         self.examples_path = config.v_repo_path / "examples"
         self.vlib_path = config.v_repo_path / "vlib"
+        
+        # V UI paths (optional)
+        self.v_ui_path = config.v_ui_path
+        self.v_ui_examples_path = config.v_ui_path / "examples" if config.v_ui_path else None
+        self.v_ui_docs_path = config.v_ui_path / "docs.md" if config.v_ui_path else None
 
         # Cache with TTL (time-to-live) in seconds
         self._cache = {}
@@ -90,20 +107,28 @@ class VDocumentationServer:
         path_status = {
             "docs": self.docs_path.exists(),
             "examples": self.examples_path.exists(),
-            "stdlib": self.vlib_path.exists()
+            "stdlib": self.vlib_path.exists(),
+            "v_ui": self.v_ui_path.exists() if self.v_ui_path else False,
+            "v_ui_examples": self.v_ui_examples_path.exists() if self.v_ui_examples_path else False
         }
 
         missing_paths = []
         for component, exists in path_status.items():
-            if not exists:
-                path = getattr(self, f"{component}_path")
-                missing_paths.append(f"{component.title()}: {path}")
+            if not exists and component not in ["v_ui", "v_ui_examples"]:  # V UI is optional
+                path = getattr(self, f"{component}_path", None)
+                if path:
+                    missing_paths.append(f"{component.title()}: {path}")
 
         if missing_paths:
             logger.warning(f"Some V repository components are missing: {', '.join(missing_paths)}")
             logger.warning("Server functionality will be limited to available components")
         else:
             logger.info("All V repository components found successfully")
+        
+        if path_status.get("v_ui"):
+            logger.info("V UI repository found and will be indexed")
+        elif self.v_ui_path:
+            logger.info(f"V UI repository path specified but not found: {self.v_ui_path}")
 
         return path_status
 
@@ -465,6 +490,98 @@ class VDocumentationServer:
                 })
 
         return info
+
+    def get_v_ui_examples_list(self) -> List[Dict]:
+        """Get a list of all V UI examples."""
+        cache_key = "v_ui_examples_list"
+        
+        # Try cache first
+        cached_result = self._get_cache(cache_key)
+        if cached_result:
+            return cached_result
+
+        if not self.v_ui_examples_path or not self.v_ui_examples_path.exists():
+            result = [{"error": "V UI examples directory not found"}]
+            self._set_cache(cache_key, result)
+            return result
+
+        examples = []
+        for item in self.v_ui_examples_path.rglob("*.v"):
+            if item.is_file():
+                examples.append({
+                    'name': item.stem,
+                    'path': str(item.relative_to(self.v_ui_path)),
+                    'full_path': str(item)
+                })
+
+        sorted_examples = sorted(examples, key=lambda x: x['name'])
+
+        # Cache the result
+        self._set_cache(cache_key, sorted_examples)
+        return sorted_examples
+
+    def get_v_ui_example_content(self, example_name: str) -> Dict:
+        """Get the content of a specific V UI example."""
+        cache_key = f"v_ui_example_{example_name}"
+
+        # Try cache first
+        cached_result = self._get_cache(cache_key)
+        if cached_result:
+            return cached_result
+
+        if not self.v_ui_examples_path or not self.v_ui_examples_path.exists():
+            result = {"error": "V UI examples directory not found"}
+            self._set_cache(cache_key, result)
+            return result
+
+        # Search for the example file
+        for item in self.v_ui_examples_path.rglob(f"{example_name}.v"):
+            if item.is_file():
+                content = self._read_file_content(item)
+                result = {
+                    'name': example_name,
+                    'path': str(item.relative_to(self.v_ui_path)),
+                    'content': content
+                }
+                self._set_cache(cache_key, result)
+                return result
+
+        result = {"error": f"V UI example '{example_name}' not found"}
+        self._set_cache(cache_key, result)
+        return result
+
+    def search_v_ui_examples(self, query: str) -> List[Dict]:
+        """Search through V UI examples for specific patterns."""
+        try:
+            query = self._validate_query(query)
+            
+            if not self.v_ui_examples_path or not self.v_ui_examples_path.exists():
+                return [{"error": f"V UI examples directory not found at {self.v_ui_examples_path}"}]
+
+            results = []
+            v_files = list(self.v_ui_examples_path.rglob("*.v"))
+
+            if not v_files:
+                return [{"error": "No V UI example files found"}]
+
+            for file_path in v_files:
+                matches = self._search_in_file(file_path, query)
+                for match in matches:
+                    match['source'] = 'v_ui'
+                    match['file'] = str(file_path.relative_to(self.v_ui_path))
+                    results.append(match)
+
+            # Sort by relevance score and limit results
+            results.sort(key=lambda x: x.get('score', 0), reverse=True)
+            results = results[:self._max_search_results]
+
+            return results if results else [{"message": f"No matches found for '{query}' in V UI examples"}]
+
+        except ValueError as e:
+            return [{"error": str(e)}]
+        except Exception as e:
+            logger.error(f"Error searching V UI examples: {e}")
+            return [{"error": f"Error searching V UI examples: {str(e)}"}]
 
 # Initialize the documentation server
 v_server = VDocumentationServer(config)
@@ -1509,6 +1626,95 @@ def clear_v_cache() -> str:
     return output
 
 @mcp.tool
+def list_v_ui_examples() -> str:
+    """
+    Get a list of available V UI examples.
+
+    Returns a comprehensive list of all available V UI code examples from the v-ui repository.
+
+    Returns:
+        JSON string containing a list of V UI examples with their names and paths
+    """
+    try:
+        if not v_server._path_status.get("v_ui_examples", False):
+            return json.dumps({
+                "error": "V UI examples are not available",
+                "message": "V UI repository not found or examples directory missing. Make sure the v-ui submodule is initialized."
+            }, indent=2)
+
+        examples = v_server.get_v_ui_examples_list()
+        
+        if examples and "error" in examples[0]:
+            return json.dumps(examples[0], indent=2)
+
+        return json.dumps({
+            "count": len(examples),
+            "examples": examples[:50]  # Limit to first 50 for readability
+        }, indent=2)
+
+    except Exception as e:
+        logger.error(f"Error listing V UI examples: {e}")
+        return json.dumps({"error": f"Error listing V UI examples: {str(e)}"}, indent=2)
+
+@mcp.tool
+def get_v_ui_example(example_name: str) -> str:
+    """
+    Get the source code of a specific V UI example.
+
+    Retrieves the complete source code for a named V UI programming example.
+
+    Args:
+        example_name: Name of the V UI example to retrieve (without .v extension)
+
+    Returns:
+        JSON string containing the example source code and metadata
+    """
+    try:
+        if not v_server._path_status.get("v_ui_examples", False):
+            return json.dumps({
+                "error": "V UI examples are not available",
+                "message": "V UI repository not found or examples directory missing."
+            }, indent=2)
+
+        result = v_server.get_v_ui_example_content(example_name)
+        return json.dumps(result, indent=2)
+
+    except Exception as e:
+        logger.error(f"Error getting V UI example: {e}")
+        return json.dumps({"error": f"Error getting V UI example: {str(e)}"}, indent=2)
+
+@mcp.tool
+def search_v_ui_examples(query: str) -> str:
+    """
+    Search through V UI example code for specific patterns or features.
+
+    Performs full-text search across all V UI programming examples in the repository.
+
+    Args:
+        query: Search query (supports regex patterns)
+
+    Returns:
+        JSON string containing search results with matching code snippets
+    """
+    try:
+        if not v_server._path_status.get("v_ui_examples", False):
+            return json.dumps({
+                "error": "V UI examples are not available",
+                "message": "V UI repository not found or examples directory missing."
+            }, indent=2)
+
+        results = v_server.search_v_ui_examples(query)
+        return json.dumps({
+            "query": query,
+            "count": len(results),
+            "results": results
+        }, indent=2)
+
+    except Exception as e:
+        logger.error(f"Error searching V UI examples: {e}")
+        return json.dumps({"error": f"Error searching V UI examples: {str(e)}"}, indent=2)
+
+@mcp.tool
 def get_v_help() -> str:
     """
     Get help and information about available V MCP server tools.
@@ -1543,6 +1749,13 @@ The V MCP Server provides comprehensive access to V programming language resourc
 - **`list_v_stdlib_modules()`** - List all V standard library modules
 - **`get_v_module_info(module_name)`** - Get detailed info about a specific module
   - Example: `get_v_module_info("os")`
+
+### 🎨 V UI Examples
+- **`list_v_ui_examples()`** - List all available V UI code examples
+- **`get_v_ui_example(name)`** - Get complete source code for a specific V UI example
+  - Example: `get_v_ui_example("users")`
+- **`search_v_ui_examples(query)`** - Search through V UI example code
+  - Example: `search_v_ui_examples("button")`
 
 ### 🎯 Language Reference
 - **`explain_v_syntax(feature)`** - Explain V language features

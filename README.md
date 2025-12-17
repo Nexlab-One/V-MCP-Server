@@ -27,6 +27,7 @@ The server is designed to improve the V development workflow:
 ### Prerequisites
 - Python 3.10+
 - V repository (you're already here!)
+- V UI submodule (automatically included)
 
 ### Install Dependencies
 ```bash
@@ -61,6 +62,11 @@ The server is now running and ready to use.
 - **`search_v_docs(query)`** - Search documentation
 - **`get_v_config()`** - View server configuration
 - **`clear_v_cache()`** - Refresh cached content
+
+### V UI Examples
+- **`list_v_ui_examples()`** - Browse V UI code examples
+- **`get_v_ui_example(name)`** - Get complete V UI example source code
+- **`search_v_ui_examples(query)`** - Find V UI examples by pattern
 
 ## Configuration
 
