@@ -26,7 +26,8 @@ The server is designed to improve the V development workflow:
 ## Quick Setup
 
 ### Prerequisites
-- Python 3.10+
+- Python 3.10+ (for Python MCP server)
+- V programming language installed (for V MCP server)
 - V repository (you're already here!)
 - V UI submodule (automatically included)
 
@@ -38,15 +39,41 @@ If you just cloned this repository, initialize the submodules:
 git submodule update --init --recursive
 ```
 
-### Install Dependencies
+This will initialize:
+- `v-ui` - V UI framework submodule
+- `v-vlang-mcp` - V-based MCP server submodule
+- `python-vlang-mcp` - Python-based MCP server submodule
+
+### Python MCP Server
+
+#### Install Dependencies
 ```bash
-cd v-mcp-server
+cd python-vlang-mcp
 pip install -r requirements.txt
 ```
 
-### Start the Server
+#### Start the Server
 ```bash
 python main.py
+```
+
+### V MCP Server
+
+#### Build the Server
+```bash
+cd v-vlang-mcp
+./build.sh    # Linux/macOS
+# or
+build.bat     # Windows
+```
+
+This creates the `v-mcp-server` (or `v-mcp-server.exe` on Windows) executable.
+
+#### Start the Server
+```bash
+./v-mcp-server    # Linux/macOS
+# or
+v-mcp-server.exe  # Windows
 ```
 
 The server is now running and ready to use.
@@ -95,7 +122,9 @@ To use the V MCP server with Cursor IDE, add the following configuration to your
 
 ### MCP Configuration
 
-Add this to your `.cursor/mcp.json` file:
+You can use either the Python or V-based server. Add one of the following configurations to your `.cursor/mcp.json` file:
+
+#### Python MCP Server
 
 ```json
 {
@@ -103,7 +132,7 @@ Add this to your `.cursor/mcp.json` file:
     "v-language-assistant": {
       "command": "python",
       "args": [
-        "/path/to/v-mcp/v-mcp-server/main.py"
+        "/path/to/v-mcp/python-vlang-mcp/main.py"
       ],
       "env": {
         "V_REPO_PATH": "/path/to/v-mcp"
@@ -113,7 +142,33 @@ Add this to your `.cursor/mcp.json` file:
 }
 ```
 
+#### V MCP Server
+
+```json
+{
+  "mcpServers": {
+    "v-language-assistant": {
+      "command": "/path/to/v-mcp/v-vlang-mcp/v-mcp-server",
+      "env": {
+        "V_REPO_PATH": "/path/to/v-mcp"
+      }
+    }
+  }
+}
+```
+
+On Windows, use `v-mcp-server.exe` instead of `v-mcp-server`.
+
 Replace `/path/to/v-mcp` with the actual path to your V MCP directory.
+
+### Server Comparison
+
+Both servers provide the same functionality:
+
+- **Python Server** (`python-vlang-mcp/`): Written in Python, easier to modify and extend (submodule)
+- **V Server** (`v-vlang-mcp/`): Written in V, native performance, single executable (submodule)
+
+Choose based on your preference or requirements.
 
 ### Usage
 
@@ -139,7 +194,7 @@ Once configured, you can ask questions like:
 python --version  # Should be 3.10+
 
 # Verify dependencies
-cd v-mcp-server
+cd python-vlang-mcp
 python -m pip install -r requirements.txt
 
 # Test server
@@ -171,9 +226,27 @@ Once configured, you can start using the V MCP server immediately. Try asking qu
 - "How do I handle errors in V?"
 - "What functions are available in the os module?"
 
-For detailed documentation and advanced configuration options, see [v-mcp-server/README.md](v-mcp-server/README.md).
+For detailed documentation and advanced configuration options:
+- Python server: [python-vlang-mcp/README.md](python-vlang-mcp/README.md)
+- V server: [v-vlang-mcp/README.md](v-vlang-mcp/README.md)
 
 For instructions on updating the V language and V UI repositories, see [UPDATE_REPOS.md](UPDATE_REPOS.md).
+
+## Project Structure
+
+```
+v-mcp/
+├── python-vlang-mcp/     # Python-based MCP server (submodule)
+│   ├── main.py           # Python server entry point
+│   └── README.md         # Python server documentation
+├── v-vlang-mcp/          # V-based MCP server (submodule)
+│   ├── src/              # V source code
+│   ├── build.sh          # Build script (Linux/macOS)
+│   ├── build.bat          # Build script (Windows)
+│   └── README.md         # V server documentation
+├── v-ui/                 # V UI framework (submodule)
+└── README.md             # This file
+```
 
 ---
 
